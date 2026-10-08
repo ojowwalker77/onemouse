@@ -66,7 +66,7 @@ fn main() {
             for msg in &out.send {
                 peer.unwrap().send(msg.clone());
             }
-            out.send.drain(..).collect::<Vec<_>>()
+            std::mem::take(&mut out.send)
         });
         if !label.is_empty() {
             eprintln!("--- {label}");
