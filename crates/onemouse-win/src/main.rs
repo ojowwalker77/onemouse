@@ -1,3 +1,7 @@
+// No console window on Windows: it runs in the background with a tray icon.
+// CLI commands still print when started from a terminal (see `attach_console`).
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -16,7 +20,8 @@ onemouse-win: receive the Mac's keyboard and trackpad on this PC
 USAGE:
     onemouse-win [--host <mac-ip>] [--port <port>] [--name <name>]
     onemouse-win --dry-run [--host <mac-ip>] [--fake-displays <layout>]
-    onemouse-win --peers | --forget <name> | --list-displays
+    onemouse-win --install [--host <mac-ip>] [...]   start at every login
+    onemouse-win --uninstall | --peers | --forget <name> | --list-displays
 
 OPTIONS:
     --host <mac-ip>           Address of the Mac (default: find it on the network)
@@ -33,7 +38,13 @@ OPTIONS:
     --peers                   Show this device's key and the paired Macs
     --forget <name>           Unpair a Mac (e.g. after it was reinstalled)
     --list-displays           Print the displays that would be reported, then exit
+    --install                 Start onemouse at every login with the other options
+                              given (Windows), then exit
+    --uninstall               Stop starting at login (Windows)
     -h, --help                Show this help
+
+On Windows it runs in the background: look for the icon in the notification
+area (Quit, Open log). The log is onemouse-win.log in the config folder.
 
 The connection is encrypted. The first time, both screens show a 6-digit
 code: pair only if they match.";
@@ -58,11 +69,28 @@ enum Command {
         name: String,
         config_dir: Option<PathBuf>,
     },
+    /// Run at login with these arguments.
+    Install(Vec<String>),
+    Uninstall,
     ListDisplays,
     Help,
 }
 
 fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
+    let args: Vec<String> = args.into_iter().collect();
+    if args.iter().any(|a| a == "--uninstall") {
+        return match args.as_slice() {
+            [_] => Ok(Command::Uninstall),
+            _ => Err("--uninstall takes no other options".into()),
+        };
+    }
+    if args.iter().any(|a| a == "--install") {
+        let rest: Vec<String> = args.into_iter().filter(|a| a != "--install").collect();
+        return match parse(rest.clone())? {
+            Command::Run(Run { dry_run: None, .. }) => Ok(Command::Install(rest)),
+            _ => Err("--install goes with the options of a normal run (e.g. --host)".into()),
+        };
+    }
     let mut args = args.into_iter();
     let (mut host, mut port, mut name) = (None, onemouse_protocol::DEFAULT_PORT, None);
     let (mut list, mut dry_run, mut fake) = (false, false, None);
@@ -152,6 +180,7 @@ fn load_trust(dir: &Path) -> io::Result<TrustStore> {
 }
 
 /// Shows the pairing code in the terminal and asks the user to compare.
+#[cfg_attr(windows, allow(dead_code))]
 fn confirm_in_terminal(req: &PairingRequest) -> bool {
     eprintln!();
     eprintln!(
@@ -179,7 +208,7 @@ fn security(dir: &Path) -> io::Result<Security> {
     Ok(Security {
         identity: Identity::load_or_create(&dir.join(IDENTITY_FILE))?,
         trust: Mutex::new(load_trust(dir)?),
-        confirm: Box::new(confirm_in_terminal),
+        confirm: Box::new(platform::confirm),
     })
 }
 
@@ -210,6 +239,7 @@ fn peers(dir: &Path) -> io::Result<()> {
 }
 
 fn main() -> ExitCode {
+    platform::attach_console();
     let command = match parse(std::env::args().skip(1)) {
         Ok(command) => command,
         Err(e) => {
@@ -223,6 +253,8 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Command::ListDisplays => return platform::list_displays(),
+        Command::Install(args) => platform::install(&args),
+        Command::Uninstall => platform::uninstall(),
         Command::Peers { config_dir: dir } => config_dir(dir, false).and_then(|dir| peers(&dir)),
         Command::Forget {
             name,
@@ -237,22 +269,28 @@ fn main() -> ExitCode {
         }),
         Command::Run(run) => {
             let dry_run = run.dry_run.is_some();
-            match config_dir(run.config_dir.clone(), dry_run).and_then(|dir| security(&dir)) {
-                Ok(security) => start(run, Arc::new(security)),
-                Err(e) => Err(e),
-            }
+            config_dir(run.config_dir.clone(), dry_run).and_then(|dir| {
+                if let Err(e) = onemouse_win::logging::to_file(&dir.join(LOG_FILE)) {
+                    eprintln!("can't write the log file: {e}");
+                }
+                let security = security(&dir)?;
+                start(run, Arc::new(security), &dir)
+            })
         }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e}");
+            log!("error: {e}");
+            platform::fatal(&e.to_string());
             ExitCode::FAILURE
         }
     }
 }
 
-fn start(run: Run, security: Arc<Security>) -> io::Result<()> {
+const LOG_FILE: &str = "onemouse-win.log";
+
+fn start(run: Run, security: Arc<Security>, dir: &Path) -> io::Result<()> {
     log!("this PC's key: {}", security.identity.fingerprint());
     match &run.host {
         Some(host) => log!("connecting to {host}:{}", run.port),
@@ -269,30 +307,116 @@ fn start(run: Run, security: Arc<Security>) -> io::Result<()> {
                 Arc::new(Mutex::new(Injector::new(LogBackend))),
             )
         }
-        None => platform::run(&config, run.name),
+        None => platform::run(&config, run.name, &dir.join(LOG_FILE)),
     }
 }
 
 #[cfg(windows)]
 mod platform {
+    use std::ffi::OsStr;
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
     use std::process::ExitCode;
+    use std::ptr;
     use std::sync::{Arc, Mutex, OnceLock};
 
+    use onemouse_transport::PairingRequest;
+    use onemouse_win::autostart::{self, SingleInstance};
     use onemouse_win::client::{self, Config, SharedInjector};
     use onemouse_win::inject::Injector;
     use onemouse_win::sendinput::SendInputBackend;
-    use onemouse_win::{WindowsHost, display, log};
-    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+    use onemouse_win::{WindowsHost, display, log, tray};
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IDYES, MB_ICONERROR, MB_ICONQUESTION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
+        MessageBoxW,
+    };
 
     static INJECTOR: OnceLock<SharedInjector<SendInputBackend>> = OnceLock::new();
 
-    /// Ctrl+C, closing the console, logoff, shutdown: release everything before
-    /// the default handler kills the process.
-    unsafe extern "system" fn on_console_event(_: u32) -> windows_sys::core::BOOL {
+    fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
+        s.as_ref().encode_wide().chain(Some(0)).collect()
+    }
+
+    fn release_all() {
         if let Some(injector) = INJECTOR.get() {
             client::lock(injector).release_all();
         }
+    }
+
+    /// Ctrl+C / Ctrl+Break are ignored: the Mac's Cmd+C arrives as Ctrl+C
+    /// and must not stop us if our own console has focus. Closing the
+    /// console, logoff, shutdown: release everything, then let it end.
+    unsafe extern "system" fn on_console_event(event: u32) -> windows_sys::core::BOOL {
+        if matches!(event, CTRL_C_EVENT | CTRL_BREAK_EVENT) {
+            return 1;
+        }
+        release_all();
         0
+    }
+
+    /// The windowless build has no console of its own; borrow the terminal
+    /// it was started from, if any, so CLI commands can print.
+    pub fn attach_console() {
+        // SAFETY: plain Win32 call; failing just means no terminal.
+        unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+    }
+
+    fn message_box(text: &str, flags: u32) -> i32 {
+        // SAFETY: valid NUL-terminated strings; no owner window.
+        unsafe {
+            MessageBoxW(
+                ptr::null_mut(),
+                wide(text).as_ptr(),
+                wide("onemouse").as_ptr(),
+                flags | MB_TOPMOST | MB_SETFOREGROUND,
+            )
+        }
+    }
+
+    /// Pairing confirmation as a dialog: the windowless build has no
+    /// console to type into.
+    pub fn confirm(req: &PairingRequest) -> bool {
+        let secs = req
+            .deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_secs();
+        let text = format!(
+            "Pair this PC with the Mac \"{}\"?\n\n\
+             Pairing code:   {}\n\n\
+             Click Yes only if the Mac shows exactly the same code \
+             (within {secs} s). If the codes differ, click No.\n\n\
+             Mac key: {}",
+            req.peer_name, req.code, req.peer_fingerprint
+        );
+        message_box(&text, MB_YESNO | MB_ICONQUESTION) == IDYES
+    }
+
+    /// Errors that end the program get a dialog too: nobody sees stderr.
+    pub fn fatal(message: &str) {
+        message_box(
+            &format!("onemouse stopped:\n\n{message}"),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+
+    pub fn install(args: &[String]) -> io::Result<()> {
+        let command = autostart::install(args)?;
+        println!("onemouse will start at every login:\n  {command}");
+        println!("Start it now with the same command, or log out and back in.");
+        Ok(())
+    }
+
+    pub fn uninstall() -> io::Result<()> {
+        if autostart::uninstall()? {
+            println!("onemouse won't start at login anymore");
+        } else {
+            println!("onemouse wasn't set to start at login");
+        }
+        Ok(())
     }
 
     pub fn list_displays() -> ExitCode {
@@ -312,12 +436,17 @@ mod platform {
         ExitCode::SUCCESS
     }
 
-    pub fn run(config: &Config, name: Option<String>) -> ! {
+    pub fn run(config: &Config, name: Option<String>, log_path: &Path) -> ! {
+        let Some(_instance) = SingleInstance::acquire() else {
+            log!("onemouse is already running on this PC; exiting");
+            std::process::exit(0);
+        };
         display::enable_dpi_awareness();
         let injector = Arc::new(Mutex::new(Injector::new(SendInputBackend)));
         let _ = INJECTOR.set(Arc::clone(&injector));
         // SAFETY: registering a handler with the right signature.
         unsafe { SetConsoleCtrlHandler(Some(on_console_event), 1) };
+        tray::start(log_path.to_owned(), release_all);
 
         display::watch();
         let name = name
@@ -337,12 +466,28 @@ mod platform {
     const ONLY_WINDOWS: &str =
         "onemouse-win injects input only on Windows; use --dry-run to test elsewhere";
 
+    pub fn attach_console() {}
+
+    pub fn confirm(req: &onemouse_transport::PairingRequest) -> bool {
+        super::confirm_in_terminal(req)
+    }
+
+    pub fn fatal(_: &str) {}
+
+    pub fn install(_: &[String]) -> std::io::Result<()> {
+        Err(std::io::Error::other("--install is Windows-only"))
+    }
+
+    pub fn uninstall() -> std::io::Result<()> {
+        Err(std::io::Error::other("--uninstall is Windows-only"))
+    }
+
     pub fn list_displays() -> ExitCode {
         eprintln!("{ONLY_WINDOWS}");
         ExitCode::FAILURE
     }
 
-    pub fn run(_: &Config, _: Option<String>) -> ! {
+    pub fn run(_: &Config, _: Option<String>, _: &std::path::Path) -> ! {
         eprintln!("{ONLY_WINDOWS}");
         std::process::exit(1)
     }
@@ -457,6 +602,20 @@ mod tests {
             config_dir(Some("/x".into()), true).unwrap(),
             PathBuf::from("/x")
         );
+    }
+
+    #[test]
+    fn parses_install_and_uninstall() {
+        assert_eq!(
+            parse(args("--install --host 192.168.0.51")),
+            Ok(Command::Install(args("--host 192.168.0.51")))
+        );
+        assert_eq!(parse(args("--install")), Ok(Command::Install(vec![])));
+        assert_eq!(parse(args("--uninstall")), Ok(Command::Uninstall));
+        assert!(parse(args("--uninstall --host x")).is_err());
+        assert!(parse(args("--install --dry-run")).is_err());
+        assert!(parse(args("--install --peers")).is_err());
+        assert!(parse(args("--install --bogus")).is_err());
     }
 
     #[test]
