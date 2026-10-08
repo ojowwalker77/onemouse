@@ -331,8 +331,8 @@ mod platform {
         ATTACH_PARENT_PROCESS, AttachConsole, CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        IDYES, MB_ICONERROR, MB_ICONQUESTION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
-        MessageBoxW,
+        FindWindowW, IDNO, IDYES, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONQUESTION, MB_OK,
+        MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO, MessageBoxW, PostMessageW, WM_COMMAND,
     };
 
     static INJECTOR: OnceLock<SharedInjector<SendInputBackend>> = OnceLock::new();
@@ -365,13 +365,13 @@ mod platform {
         unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
     }
 
-    fn message_box(text: &str, flags: u32) -> i32 {
+    fn message_box(title: &str, text: &str, flags: u32) -> i32 {
         // SAFETY: valid NUL-terminated strings; no owner window.
         unsafe {
             MessageBoxW(
                 ptr::null_mut(),
                 wide(text).as_ptr(),
-                wide("onemouse").as_ptr(),
+                wide(title).as_ptr(),
                 flags | MB_TOPMOST | MB_SETFOREGROUND,
             )
         }
@@ -392,12 +392,41 @@ mod platform {
              Mac key: {}",
             req.peer_name, req.code, req.peer_fingerprint
         );
-        message_box(&text, MB_YESNO | MB_ICONQUESTION) == IDYES
+        // Unique title, so we can find the box to close it at the deadline.
+        let title = format!("onemouse: pair with {}?", req.code);
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let title = title.clone();
+            // No is the default button: a stray Enter typed from the Mac while
+            // the box pops up must not approve a pairing.
+            std::thread::spawn(move || {
+                let flags = MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2;
+                let _ = tx.send(message_box(&title, &text, flags) == IDYES);
+            });
+        }
+        let left = req
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(answer) => answer,
+            Err(_) => {
+                // Too late anyway: close the box as "No".
+                // SAFETY: plain window lookup and a posted message.
+                unsafe {
+                    let hwnd = FindWindowW(wide("#32770").as_ptr(), wide(&title).as_ptr());
+                    if !hwnd.is_null() {
+                        PostMessageW(hwnd, WM_COMMAND, IDNO as usize, 0);
+                    }
+                }
+                false
+            }
+        }
     }
 
     /// Errors that end the program get a dialog too: nobody sees stderr.
     pub fn fatal(message: &str) {
         message_box(
+            "onemouse",
             &format!("onemouse stopped:\n\n{message}"),
             MB_OK | MB_ICONERROR,
         );
