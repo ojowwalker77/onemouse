@@ -96,11 +96,17 @@ mod tests {
     fn plist_runs_the_installed_copy_with_escaped_args() {
         let p = Paths::under(Path::new("/Users/jow"));
         let xml = plist(&p, &["--name".into(), "jow's <Mac> & co".into()]);
-        assert!(xml.contains(
-            "<string>/Users/jow/Library/Application Support/onemouse/onemouse-mac</string>\n        <string>--name</string>\n        <string>jow's &lt;Mac&gt; &amp; co</string>"
-        ));
+        // Paths render with the platform separator (backslashes on
+        // Windows); derive them instead of hardcoding slashes. The plist
+        // itself is macOS-only (launchd); elsewhere this exercises the
+        // string logic.
+        let exe = p.exe.to_string_lossy();
+        let log = p.log.to_string_lossy();
+        assert!(xml.contains(&format!(
+            "<string>{exe}</string>\n        <string>--name</string>\n        <string>jow's &lt;Mac&gt; &amp; co</string>"
+        )));
         assert!(xml.contains("<key>SuccessfulExit</key>\n        <false/>"));
-        assert!(xml.contains("<string>/Users/jow/Library/Logs/onemouse.log</string>"));
+        assert!(xml.contains(&format!("<string>{log}</string>")));
         assert!(xml.contains("<string>com.onemouse.mac</string>"));
     }
 
