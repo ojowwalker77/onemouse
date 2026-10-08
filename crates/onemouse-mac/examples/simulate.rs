@@ -6,7 +6,7 @@ use std::net::TcpListener;
 use std::thread;
 use std::time::Duration;
 
-use onemouse_mac::controller::{Controller, Input};
+use onemouse_mac::controller::{Controller, Input, Peer};
 use onemouse_mac::layout::{Point, Rect, Side};
 use onemouse_mac::server::{self, Link};
 use onemouse_protocol::key;
@@ -62,7 +62,11 @@ fn main() {
     let mut controller = Controller::new(Side::Right);
     for (label, input) in script {
         let out = link.with_peer(|peer| {
-            let mut out = controller.handle(input, &mac, peer.map(|p| p.displays.as_slice()));
+            let view = peer.map(|p| Peer {
+                id: p.id(),
+                displays: &p.displays,
+            });
+            let mut out = controller.handle(input, &mac, view);
             for msg in &out.send {
                 peer.unwrap().send(msg.clone());
             }

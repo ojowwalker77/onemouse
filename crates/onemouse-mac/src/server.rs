@@ -44,6 +44,8 @@ impl Config {
 #[derive(Debug)]
 pub struct Peer {
     pub name: String,
+    /// Remote address, for logs.
+    pub addr: String,
     pub displays: Vec<Display>,
     id: u64,
     tx: Sender<Message>,
@@ -51,6 +53,11 @@ pub struct Peer {
 }
 
 impl Peer {
+    /// Unique per connection.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Queues `msg`; never blocks. Lost if the connection is going away.
     pub fn send(&self, msg: Message) {
         let _ = self.tx.send(msg);
@@ -212,6 +219,9 @@ fn session(stream: TcpStream, link: &Link, config: &Config) -> Result<String, Se
     let (tx, rx) = mpsc::channel();
     let id = link.attach(Peer {
         name: name.clone(),
+        addr: stream
+            .peer_addr()
+            .map_or_else(|_| "?".into(), |a| a.ip().to_string()),
         displays: hello.displays,
         id: 0,
         tx: tx.clone(),

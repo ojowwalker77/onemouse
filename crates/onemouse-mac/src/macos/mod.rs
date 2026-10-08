@@ -17,7 +17,7 @@ use onemouse_protocol::MouseButton;
 use onemouse_protocol::key;
 
 use self::ffi::*;
-use crate::controller::{Controller, Input, Output};
+use crate::controller::{self, Controller, Input, Output};
 use crate::keymap;
 use crate::layout::{Point, Rect};
 use crate::log;
@@ -182,11 +182,16 @@ fn handle(tap: &Tap, input: Input) -> bool {
         Vec::new()
     };
     let out: Output = tap.link.with_peer(|peer| {
-        let mut out =
-            tap.controller
-                .borrow_mut()
-                .handle(input, &mac, peer.map(|p| p.displays.as_slice()));
+        let view = peer.map(|p| controller::Peer {
+            id: p.id(),
+            displays: &p.displays,
+        });
+        let mut out = tap.controller.borrow_mut().handle(input, &mac, view);
         if let Some(peer) = peer {
+            if out.went_remote {
+                // Until M2 anyone on the LAN can connect: make it visible.
+                log!("cursor → {} ({})", peer.name, peer.addr);
+            }
             for msg in out.send.drain(..) {
                 peer.send(msg);
             }
