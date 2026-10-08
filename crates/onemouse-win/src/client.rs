@@ -29,6 +29,10 @@ pub trait Host: Send + Sync + 'static {
     fn display_generation(&self) -> u64 {
         0
     }
+
+    /// Short connection status for the UI (tray tooltip), e.g.
+    /// "Connected to jow's MacBook Air".
+    fn status(&self, _status: &str) {}
 }
 
 /// A host with a fixed name and display layout (`--dry-run`, tests).
@@ -196,8 +200,14 @@ pub fn run<H: Host, B: Backend + Send + 'static>(
         let started = Instant::now();
         let mut welcomed = false;
         match run_session(config, &host, &injector, || welcomed = true) {
-            Ok(()) => log!("disconnected"),
-            Err(e) => log!("connection ended: {e}"),
+            Ok(()) => {
+                log!("disconnected");
+                host.status("Disconnected, reconnecting…");
+            }
+            Err(e) => {
+                log!("connection ended: {e}");
+                host.status(&format!("Not connected: {e}"));
+            }
         }
         lock(&injector).release_all();
         if welcomed && started.elapsed() > Duration::from_secs(10) {
@@ -383,6 +393,7 @@ fn session<H: Host, B: Backend + Send + 'static>(
                 "connected to {name} ({} display(s) reported)",
                 displays.len()
             );
+            host.status(&format!("Connected to {name}"));
         }
         Message::Reject { reason } => return Err(ClientError::Rejected(reason)),
         other => {
