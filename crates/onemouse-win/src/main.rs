@@ -161,7 +161,11 @@ fn confirm_in_terminal(req: &PairingRequest) -> bool {
     eprintln!();
     eprintln!("      Pairing code:  {}", req.code);
     eprintln!();
-    eprintln!("  Check that the Mac shows the same code.");
+    let secs = req
+        .deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .as_secs();
+    eprintln!("  Check that the Mac shows the same code (within {secs} s).");
     eprint!("  Type y and press Enter if it matches (anything else cancels): ");
     let _ = io::stderr().flush();
     let mut answer = String::new();

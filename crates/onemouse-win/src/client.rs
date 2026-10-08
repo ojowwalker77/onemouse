@@ -218,29 +218,52 @@ pub fn run_session<H: Host, B: Backend + Send + 'static>(
     injector: &SharedInjector<B>,
     on_welcome: impl FnOnce(),
 ) -> Result<(), ClientError> {
-    let tcp = connect(config)?;
-    let result = session(config, host, injector, &tcp, on_welcome);
-    lock(injector).release_all();
-    let _ = tcp.shutdown(Shutdown::Both);
-    result
-}
-
-fn connect(config: &Config) -> Result<TcpStream, ClientError> {
-    let addrs: Vec<SocketAddr> = match &config.host {
-        Some(host) => (host.as_str(), config.port).to_socket_addrs()?.collect(),
-        None => discover(config)?,
-    };
-    let mut last_err = io::Error::new(io::ErrorKind::NotFound, "host resolved to no address");
-    for addr in addrs {
-        match TcpStream::connect_timeout(&addr, config.connect_timeout) {
-            Ok(stream) => return Ok(stream),
-            Err(e) => last_err = e,
+    let mut on_welcome = Some(on_welcome);
+    let mut last_err = None;
+    // Several candidates when discovery sees more than one answer for our
+    // Mac (e.g. someone else advertising its fingerprint): the handshake
+    // tells the real one apart, so failures before Welcome move on.
+    for addr in candidates(config)? {
+        let tcp = match TcpStream::connect_timeout(&addr, config.connect_timeout) {
+            Ok(tcp) => tcp,
+            Err(e) => {
+                last_err = Some(e.into());
+                continue;
+            }
+        };
+        let mut welcomed = false;
+        let result = session(config, host, injector, &tcp, || {
+            welcomed = true;
+            if let Some(f) = on_welcome.take() {
+                f();
+            }
+        });
+        lock(injector).release_all();
+        let _ = tcp.shutdown(Shutdown::Both);
+        match result {
+            Err(e) if !welcomed => {
+                log!("{addr}: {e}");
+                last_err = Some(e);
+            }
+            other => return other,
         }
     }
-    Err(last_err.into())
+    Err(last_err.unwrap_or_else(|| {
+        ClientError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            "host resolved to no address",
+        ))
+    }))
 }
 
-/// Finds the primary over mDNS: a paired one if visible, else the only one.
+fn candidates(config: &Config) -> Result<Vec<SocketAddr>, ClientError> {
+    match &config.host {
+        Some(host) => Ok((host.as_str(), config.port).to_socket_addrs()?.collect()),
+        None => discover(config),
+    }
+}
+
+/// Finds the primary over mDNS.
 fn discover(config: &Config) -> Result<Vec<SocketAddr>, ClientError> {
     let pinned: Vec<String> = config
         .security
@@ -253,37 +276,52 @@ fn discover(config: &Config) -> Result<Vec<SocketAddr>, ClientError> {
         .collect();
     let found = discovery::browse(config.discovery_timeout, pinned.first().map(String::as_str))
         .map_err(|e| ClientError::Discovery(format!("mDNS browse failed: {e}")))?;
+    let chosen = choose(&found, &pinned).map_err(ClientError::Discovery)?;
+    for f in &chosen {
+        log!("found {} at {}", f.name, display_addrs(&f.addrs));
+    }
+    Ok(chosen
+        .iter()
+        .flat_map(|f| f.addrs.iter().map(|ip| SocketAddr::new(*ip, f.port)))
+        .collect())
+}
+
+/// Which advertisements to try, in order: every one claiming a paired Mac's
+/// fingerprint; else, if all compatible ones claim the same fingerprint (the
+/// usual first-pairing case), all of them; else none (ambiguous).
+fn choose<'a>(
+    found: &'a [discovery::Found],
+    pinned: &[String],
+) -> Result<Vec<&'a discovery::Found>, String> {
     let compatible: Vec<_> = found
         .iter()
         .filter(|f| f.version == Some(PROTOCOL_VERSION) && !f.addrs.is_empty())
         .collect();
-    let chosen = compatible
+    let paired: Vec<_> = compatible
         .iter()
-        .find(|f| pinned.contains(&f.fingerprint))
-        .or(match compatible.as_slice() {
-            [only] => Some(only),
-            _ => None,
-        })
-        .ok_or_else(|| {
-            let seen: Vec<_> = found
-                .iter()
-                .map(|f| format!("{} (v{})", f.name, f.version.unwrap_or(0)))
-                .collect();
-            ClientError::Discovery(if seen.is_empty() {
-                "no Mac found on the network; is onemouse running there? (or pass --host)".into()
-            } else {
-                format!(
-                    "can't tell which Mac to use: found {}; pass --host",
-                    seen.join(", ")
-                )
-            })
-        })?;
-    log!("found {} at {}", chosen.name, display_addrs(&chosen.addrs));
-    Ok(chosen
-        .addrs
+        .copied()
+        .filter(|f| pinned.contains(&f.fingerprint))
+        .collect();
+    if !paired.is_empty() {
+        return Ok(paired);
+    }
+    let mut fingerprints: Vec<_> = compatible.iter().map(|f| &f.fingerprint).collect();
+    fingerprints.dedup();
+    if fingerprints.len() == 1 {
+        return Ok(compatible);
+    }
+    let seen: Vec<_> = found
         .iter()
-        .map(|ip| SocketAddr::new(*ip, chosen.port))
-        .collect())
+        .map(|f| format!("{} (v{})", f.name, f.version.unwrap_or(0)))
+        .collect();
+    Err(if seen.is_empty() {
+        "no Mac found on the network; is onemouse running there? (or pass --host)".into()
+    } else {
+        format!(
+            "can't tell which Mac to use: found {}; pass --host",
+            seen.join(", ")
+        )
+    })
 }
 
 fn display_addrs(addrs: &[IpAddr]) -> String {
@@ -554,6 +592,9 @@ mod tests {
         identity: Identity,
         trust: Mutex<TrustStore>,
         can_pair: bool,
+        /// Its own, so it doesn't compete with the PC side for the
+        /// process-wide slot.
+        slot: onemouse_transport::PairingSlot,
     }
 
     struct Harness {
@@ -602,6 +643,7 @@ mod tests {
                     identity: Identity::generate().unwrap(),
                     trust: Mutex::new(TrustStore::in_memory()),
                     can_pair: false,
+                    slot: onemouse_transport::PairingSlot::new(),
                 },
                 host: Arc::new(TestHost {
                     displays: Mutex::new(vec![display(0)]),
@@ -628,6 +670,7 @@ mod tests {
             let opts = onemouse_transport::Options {
                 can_pair: self.mac.can_pair,
                 confirm: &confirm,
+                pairing_slot: &self.mac.slot,
                 ..onemouse_transport::Options::new(&self.mac.identity, "macbook", &self.mac.trust)
             };
             onemouse_transport::accept(tcp, &opts).map(|(secure, _)| secure)
@@ -912,6 +955,39 @@ mod tests {
         assert_eq!(&pinned[0].key, h.mac.identity.public_key());
         drop(primary);
         client.join().unwrap().unwrap_err();
+    }
+
+    fn found(name: &str, fp: &str, version: u16, ip: &str) -> discovery::Found {
+        discovery::Found {
+            name: name.into(),
+            version: Some(version),
+            fingerprint: fp.into(),
+            addrs: vec![ip.parse().unwrap()],
+            port: 24801,
+        }
+    }
+
+    #[test]
+    fn discovery_prefers_paired_macs_and_keeps_every_claimant() {
+        let v = PROTOCOL_VERSION;
+        let real = found("mac", "aa", v, "10.0.0.2");
+        let spoof = found("mac", "aa", v, "10.0.0.66");
+        let other = found("office", "bb", v, "10.0.0.3");
+        let old = found("old mac", "cc", v - 1, "10.0.0.4");
+        let all = [spoof.clone(), other.clone(), real.clone(), old.clone()];
+
+        // Paired with "aa": both claimants, the handshake sorts them out.
+        let chosen = choose(&all, &["aa".into()]).unwrap();
+        assert_eq!(chosen, [&spoof, &real]);
+
+        // First pairing, one fingerprint around (plus an old version).
+        let first = [real.clone(), old.clone()];
+        assert_eq!(choose(&first, &[]).unwrap(), [&real]);
+
+        // First pairing, two different Macs: ask the user.
+        let err = choose(&[real.clone(), other], &[]).unwrap_err();
+        assert!(err.contains("pass --host"), "{err}");
+        assert!(choose(&[], &[]).unwrap_err().contains("no Mac found"));
     }
 
     #[test]
