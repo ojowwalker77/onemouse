@@ -53,7 +53,8 @@ keys! {
     NUMPAD_5 = 0x5D, NUMPAD_6 = 0x5E, NUMPAD_7 = 0x5F, NUMPAD_8 = 0x60,
     NUMPAD_9 = 0x61, NUMPAD_0 = 0x62, NUMPAD_DECIMAL = 0x63,
 
-    /// The extra key next to left Shift on ISO keyboards (§ on Mac ISO).
+    /// The extra key next to left Shift on ISO keyboards. Apple ISO keyboards
+    /// swap it with the top-left key, see `BACKQUOTE` / `kVK_ISO_Section`.
     INTL_BACKSLASH = 0x64,
     CONTEXT_MENU = 0x65,
     NUMPAD_EQUAL = 0x67,
