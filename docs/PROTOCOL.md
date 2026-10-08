@@ -13,7 +13,7 @@ The TCP connection is encrypted and mutually authenticated by [`crates/onemouse-
 
 1. Noise `XX_25519_ChaChaPoly_BLAKE2s` handshake; the secondary initiates; device names travel in the handshake.
 2. Trust exchange: pinned keys continue silently; a name pinned to a different key closes the connection (never re-paired automatically); otherwise **pairing**.
-3. Pairing: both screens show a 6-digit code derived from the handshake hash, both users confirm it matches, then each side pins the other's key. The primary only pairs while its user has pairing mode open. 60 s limit.
+3. Pairing: both screens show a 6-digit code derived from the handshake hash **and two random nonces exchanged commit-then-reveal** (the initiator commits to its nonce before seeing the responder's, so nobody, not even a man in the middle running two handshakes, can steer the code). Both users confirm it matches, then each side pins the other's key. The primary only pairs while its user has pairing mode open, one pairing at a time. 60 s limit.
 4. Everything below (framing, messages) runs unchanged inside encrypted records.
 
 Discovery: the primary advertises `_onemouse._tcp` over mDNS with TXT `fp=<key fingerprint>`, `name=`, `v=<PROTOCOL_VERSION>`.
