@@ -1,0 +1,10 @@
+[package]
+name = "onemouse-mac"
+description = "onemouse primary for macOS: captures the keyboard and trackpad and drives the secondary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+onemouse-protocol.workspace = true
