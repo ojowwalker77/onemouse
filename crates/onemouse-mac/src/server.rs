@@ -15,7 +15,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use onemouse_protocol::{
-    Display, FrameError, Message, PROTOCOL_VERSION, read_message, write_message,
+    Display, FrameError, Main, Message, Os, PROTOCOL_VERSION, read_message, write_message,
 };
 use onemouse_transport::{Identity, Options, PairingRequest, TrustStore};
 
@@ -81,6 +81,15 @@ pub struct Config {
     pub ping_interval: Duration,
     /// Drop the connection when nothing arrives for this long.
     pub silence_timeout: Duration,
+    /// This Mac's OS marker, displays and "keyboard & mouse are on" setting,
+    /// sent in `Welcome` (v3). The server's `main` is authoritative at
+    /// connect; the client adopts it.
+    pub os: Os,
+    pub displays: Vec<Display>,
+    pub main: Main,
+    /// The client's desktop origin in this Mac's coordinates, sent as
+    /// `Arrangement` right after `Welcome` when arranged.
+    pub arrangement: Option<(i32, i32)>,
 }
 
 impl Config {
@@ -90,6 +99,10 @@ impl Config {
             security,
             ping_interval: Duration::from_secs(2),
             silence_timeout: Duration::from_secs(6),
+            os: Os::MacOs,
+            displays: Vec::new(),
+            main: Main::Server,
+            arrangement: None,
         }
     }
 }
@@ -286,8 +299,14 @@ fn session(stream: TcpStream, link: &Link, config: &Config) -> Result<String, Se
         &Message::Welcome {
             protocol_version: PROTOCOL_VERSION,
             name: config.name.clone(),
+            os: config.os,
+            displays: config.displays.clone(),
+            main: config.main,
         },
     )?;
+    if let Some((x, y)) = config.arrangement {
+        write_message(&mut writer, &Message::Arrangement { x, y })?;
+    }
 
     // The name the PC proved with its key, not whatever `Hello` claims.
     let name = who.name;
@@ -502,7 +521,10 @@ mod tests {
             read_message(&mut s).unwrap(),
             Message::Welcome {
                 protocol_version: PROTOCOL_VERSION,
-                name: "mac".into()
+                name: "mac".into(),
+                os: Os::MacOs,
+                displays: vec![],
+                main: Main::Server,
             }
         );
         eventually(|| peer_displays(&link) == Some(vec![display(0)]));
