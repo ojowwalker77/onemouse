@@ -344,6 +344,7 @@ name = "onemouse-win"
 version = "0.1.0"
 dependencies = [
  "onemouse-protocol",
+ "onemouse-transport",
  "windows-sys",
 ]
 
