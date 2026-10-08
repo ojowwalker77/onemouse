@@ -24,7 +24,9 @@ use crate::controller::{self, Controller, Input, Output};
 use crate::keymap;
 use crate::layout::{Point, Rect};
 use crate::log;
+use crate::pairing::Prompts;
 use crate::server::Link;
+use crate::server::Security;
 
 /// Trackpad points → protocol scroll units (120 per notch).
 const SCROLL_UNITS_PER_POINT: f64 = 2.0;
@@ -76,14 +78,28 @@ pub fn keyboard_is_iso() -> bool {
     unsafe { KBGetLayoutType(LMGetKbdType().into()) == kKeyboardISO }
 }
 
+/// What the app is started with.
+pub struct App {
+    pub link: Arc<Link>,
+    pub security: Arc<Security>,
+    /// Pairing questions from connection threads, answered in a dialog.
+    pub prompts: Arc<Prompts>,
+    pub config: Config,
+    pub config_path: Option<PathBuf>,
+    pub scroll_speed: f64,
+    /// Open the Arrange Displays window at launch.
+    pub arrange_at_start: bool,
+}
+
 /// Everything the event tap and the UI share. Only touched on the main
 /// thread.
 struct Tap {
     controller: RefCell<Controller>,
     link: Arc<Link>,
+    security: Arc<Security>,
+    prompts: Arc<Prompts>,
     config: RefCell<Config>,
     config_path: Option<PathBuf>,
-    /// Open the Arrange Displays window at launch.
     arrange_at_start: bool,
     iso: bool,
     scroll_speed: f64,
@@ -92,22 +108,17 @@ struct Tap {
 }
 
 /// Installs the event tap and runs the menu-bar app until Quit.
-pub fn run(
-    controller: Controller,
-    link: Arc<Link>,
-    config: Config,
-    config_path: Option<PathBuf>,
-    scroll_speed: f64,
-    arrange_at_start: bool,
-) -> Result<(), String> {
+pub fn run(controller: Controller, app: App) -> Result<(), String> {
     let tap: &'static Tap = Box::leak(Box::new(Tap {
         controller: RefCell::new(controller),
-        link,
-        config: RefCell::new(config),
-        config_path,
-        arrange_at_start,
+        link: app.link,
+        security: app.security,
+        prompts: app.prompts,
+        config: RefCell::new(app.config),
+        config_path: app.config_path,
+        arrange_at_start: app.arrange_at_start,
         iso: keyboard_is_iso(),
-        scroll_speed,
+        scroll_speed: app.scroll_speed,
         port: Cell::new(ptr::null_mut()),
         cursor_hidden: Cell::new(false),
     }));

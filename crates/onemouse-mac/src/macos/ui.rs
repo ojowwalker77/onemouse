@@ -2,18 +2,21 @@
 //! PC's, drawn to scale; drag the PC to where it sits on the desk.
 
 use std::cell::{Cell, RefCell};
+use std::time::Duration;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBezierPath, NSColor,
-    NSEvent, NSFont, NSFontAttributeName, NSForegroundColorAttributeName, NSMenu, NSMenuDelegate,
-    NSMenuItem, NSStatusBar, NSStringDrawing, NSVariableStatusItemLength, NSView, NSWindow,
+    NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicy,
+    NSBackingStoreType, NSBezierPath, NSColor, NSEvent, NSFont, NSFontAttributeName,
+    NSForegroundColorAttributeName, NSMenu, NSMenuDelegate, NSMenuItem, NSModalPanelRunLoopMode,
+    NSStatusBar, NSStatusItem, NSStringDrawing, NSVariableStatusItemLength, NSView, NSWindow,
     NSWindowStyleMask,
 };
-use objc2_foundation::{NSDictionary, NSPoint, NSRect, NSSize, NSString, NSTimer};
+use objc2_foundation::{NSDictionary, NSPoint, NSRect, NSRunLoop, NSSize, NSString, NSTimer};
 use onemouse_protocol::Display;
+use onemouse_transport::PairingRequest;
 
 use super::{Tap, displays};
 use crate::layout::{self, Point, Rect};
@@ -42,15 +45,30 @@ pub(super) fn run(tap: &'static Tap) {
     // SAFETY: `target` implements `openArrange:` and outlives the menu.
     unsafe { arrange.setTarget(Some(&target)) };
     menu.addItem(&arrange);
+    let pair = item(mtm, "Pair a New PC…", Some(sel!(togglePairing:)));
+    // SAFETY: `target` implements `togglePairing:` and outlives the menu.
+    unsafe { pair.setTarget(Some(&target)) };
+    menu.addItem(&pair);
     menu.addItem(&NSMenuItem::separatorItem(mtm));
+    let key = item(
+        mtm,
+        &format!(
+            "This Mac's key: {}",
+            short(&tap.security.identity.fingerprint())
+        ),
+        None,
+    );
+    key.setEnabled(false);
+    menu.addItem(&key);
     menu.addItem(&item(mtm, "Quit onemouse", Some(sel!(terminate:))));
     status.setMenu(Some(&menu));
     *target.ivars().status_line.borrow_mut() = Some(status_line);
+    *target.ivars().pair_item.borrow_mut() = Some(pair);
 
     // SAFETY: `target` implements `tick:`; the timer retains it.
     unsafe {
         NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
-            1.0,
+            0.5,
             &target,
             sel!(tick:),
             None,
@@ -60,8 +78,9 @@ pub(super) fn run(tap: &'static Tap) {
     if tap.arrange_at_start {
         target.show_window();
     }
+    *target.ivars().status.borrow_mut() = Some(status);
     // Lives as long as the app.
-    std::mem::forget((status, menu, target));
+    std::mem::forget((menu, target));
     app.run();
 }
 
@@ -92,9 +111,21 @@ fn secondary(tap: &Tap) -> Option<(String, Vec<Display>, bool)> {
         })
 }
 
+/// How long "Pair a New PC…" stays open.
+const PAIRING_WINDOW: Duration = Duration::from_secs(120);
+/// How long the code dialog waits for the user (the PC gives up then too).
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// First 8 hex digits, as people compare them.
+fn short(fingerprint: &str) -> &str {
+    fingerprint.get(..8).unwrap_or(fingerprint)
+}
+
 pub(super) struct TargetIvars {
     tap: &'static Tap,
+    status: RefCell<Option<Retained<NSStatusItem>>>,
     status_line: RefCell<Option<Retained<NSMenuItem>>>,
+    pair_item: RefCell<Option<Retained<NSMenuItem>>>,
     window: RefCell<Option<Retained<NSWindow>>>,
     view: RefCell<Option<Retained<ArrangeView>>>,
 }
@@ -112,8 +143,30 @@ define_class!(
             self.show_window();
         }
 
+        #[unsafe(method(togglePairing:))]
+        fn toggle_pairing(&self, _sender: Option<&AnyObject>) {
+            let security = &self.ivars().tap.security;
+            if security.pairing_left().is_some() {
+                security.close_pairing();
+                log!("pairing closed");
+            } else {
+                security.open_pairing(PAIRING_WINDOW);
+                log!("pairing open for {} s: start onemouse-win on the PC", PAIRING_WINDOW.as_secs());
+            }
+            self.update_status_title();
+        }
+
+        #[unsafe(method(abortPairingDialog:))]
+        fn abort_pairing_dialog(&self, _timer: &NSTimer) {
+            NSApplication::sharedApplication(self.mtm()).abortModal();
+        }
+
         #[unsafe(method(tick:))]
         fn tick(&self, _timer: &NSTimer) {
+            self.update_status_title();
+            if let Some((request, answer)) = self.ivars().tap.prompts.next() {
+                let _ = answer.send(self.confirm_pairing(&request));
+            }
             self.remember_displays();
             if let Some(window) = &*self.ivars().window.borrow()
                 && window.isVisible()
@@ -136,6 +189,13 @@ define_class!(
             if let Some(line) = &*self.ivars().status_line.borrow() {
                 line.setTitle(&NSString::from_str(&title));
             }
+            let pair = match self.ivars().tap.security.pairing_left() {
+                Some(left) => format!("Stop Pairing ({} s left)", left.as_secs()),
+                None => "Pair a New PC…".into(),
+            };
+            if let Some(item) = &*self.ivars().pair_item.borrow() {
+                item.setTitle(&NSString::from_str(&pair));
+            }
         }
     }
 );
@@ -144,7 +204,9 @@ impl Target {
     fn new(mtm: MainThreadMarker, tap: &'static Tap) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(TargetIvars {
             tap,
+            status: RefCell::new(None),
             status_line: RefCell::new(None),
+            pair_item: RefCell::new(None),
             window: RefCell::new(None),
             view: RefCell::new(None),
         });
@@ -181,6 +243,60 @@ impl Target {
             window.makeKeyAndOrderFront(None);
         }
         NSApplication::sharedApplication(mtm).activate();
+    }
+
+    /// "⇄" normally, "⇄ pairing" while a new PC may pair.
+    fn update_status_title(&self) {
+        let pairing = self.ivars().tap.security.pairing_left().is_some();
+        if let Some(status) = &*self.ivars().status.borrow()
+            && let Some(button) = status.button(self.mtm())
+        {
+            button.setTitle(&NSString::from_str(if pairing {
+                "⇄ pairing"
+            } else {
+                "⇄"
+            }));
+        }
+    }
+
+    /// Shows the pairing code and asks whether the PC shows the same one.
+    /// Closes by itself when the PC stops waiting.
+    fn confirm_pairing(&self, request: &PairingRequest) -> bool {
+        let mtm = self.mtm();
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str(&format!(
+            "Pair with {}?",
+            request.peer_name
+        )));
+        alert.setInformativeText(&NSString::from_str(&format!(
+            "Only pair if the PC shows the same code:\n\n{}\n\nPC key: {}",
+            request.code,
+            short(&request.peer_fingerprint)
+        )));
+        alert.addButtonWithTitle(&NSString::from_str("Pair"));
+        alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+        // SAFETY: `self` implements `abortPairingDialog:`; the timer is
+        // invalidated below, after the dialog closes.
+        let timer = unsafe {
+            NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
+                CONFIRM_TIMEOUT.as_secs_f64(),
+                self,
+                sel!(abortPairingDialog:),
+                None,
+                false,
+            )
+        };
+        // SAFETY: valid timer and run loop mode.
+        unsafe { NSRunLoop::currentRunLoop().addTimer_forMode(&timer, NSModalPanelRunLoopMode) };
+        NSApplication::sharedApplication(mtm).activate();
+        let paired = alert.runModal() == NSAlertFirstButtonReturn;
+        timer.invalidate();
+        log!(
+            "pairing with {} {}",
+            request.peer_name,
+            if paired { "confirmed" } else { "declined" }
+        );
+        paired
     }
 
     /// Keeps the last seen PC layout so it can be arranged while offline.

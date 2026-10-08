@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 onemouse-protocol.workspace = true
+onemouse-transport.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.5"
