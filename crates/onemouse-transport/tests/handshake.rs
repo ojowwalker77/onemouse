@@ -1,0 +1,356 @@
+//! End-to-end handshakes over loopback TCP.
+
+use std::net::{TcpListener, TcpStream};
+use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
+
+use onemouse_protocol::{Message, read_message, write_message};
+use onemouse_transport::{
+    Error, Identity, Options, PairingRequest, PairingSlot, Peer, SecureStream, TrustStore,
+};
+
+struct Side {
+    identity: Identity,
+    name: &'static str,
+    trust: Mutex<TrustStore>,
+    can_pair: bool,
+    answer: bool,
+    delay: Duration,
+    seen: Mutex<Vec<PairingRequest>>,
+    /// Per side: tests run in parallel in one process.
+    slot: PairingSlot,
+}
+
+impl Side {
+    fn new(name: &'static str) -> Self {
+        Self {
+            identity: Identity::generate().unwrap(),
+            name,
+            trust: Mutex::new(TrustStore::in_memory()),
+            can_pair: true,
+            answer: true,
+            delay: Duration::ZERO,
+            seen: Mutex::new(Vec::new()),
+            slot: PairingSlot::new(),
+        }
+    }
+
+    fn pin(&self, other: &Side) {
+        self.trust
+            .lock()
+            .unwrap()
+            .pin(other.name, other.identity.public_key())
+            .unwrap();
+    }
+
+    fn run(&self, stream: TcpStream, initiator: bool) -> Result<(SecureStream, Peer), Error> {
+        let confirm = |req: &PairingRequest| {
+            self.seen.lock().unwrap().push(req.clone());
+            thread::sleep(self.delay);
+            self.answer
+        };
+        let opts = Options {
+            can_pair: self.can_pair,
+            confirm: &confirm,
+            pairing_timeout: Duration::from_millis(500),
+            pairing_slot: &self.slot,
+            ..Options::new(&self.identity, self.name, &self.trust)
+        };
+        if initiator {
+            onemouse_transport::connect(stream, &opts)
+        } else {
+            onemouse_transport::accept(stream, &opts)
+        }
+    }
+
+    fn requests(&self) -> Vec<PairingRequest> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+type Outcome = Result<(SecureStream, Peer), Error>;
+
+/// `pc` connects to `mac` over loopback.
+fn run(pc: &Side, mac: &Side) -> (Outcome, Outcome) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::scope(|s| {
+        let server = s.spawn(|| mac.run(listener.accept().unwrap().0, false));
+        let client = pc.run(TcpStream::connect(addr).unwrap(), true);
+        (client, server.join().unwrap())
+    })
+}
+
+#[test]
+fn pinned_peers_connect_silently_and_exchange_messages() {
+    let (pc, mac) = (Side::new("desk"), Side::new("macbook"));
+    pc.pin(&mac);
+    mac.pin(&pc);
+    let (client, server) = run(&pc, &mac);
+    let (mut client, mac_seen) = client.unwrap();
+    let (server, pc_seen) = server.unwrap();
+    assert_eq!(mac_seen.name, "macbook");
+    assert_eq!(&mac_seen.key, mac.identity.public_key());
+    assert!(!mac_seen.newly_paired);
+    assert_eq!(pc_seen.fingerprint(), pc.identity.fingerprint());
+    assert!(pc.requests().is_empty() && mac.requests().is_empty());
+
+    // The existing framing runs unchanged on top, in both directions and
+    // across reader/writer halves.
+    let (mut reader, mut writer) = server.split();
+    let big = Message::Reject {
+        reason: "x".repeat(200_000),
+    };
+    write_message(&mut client, &Message::Ping(7)).unwrap();
+    write_message(&mut client, &big).unwrap();
+    assert_eq!(read_message(&mut reader).unwrap(), Message::Ping(7));
+    assert_eq!(read_message(&mut reader).unwrap(), big);
+    write_message(&mut writer, &Message::Pong(7)).unwrap();
+    assert_eq!(read_message(&mut client).unwrap(), Message::Pong(7));
+}
+
+#[test]
+fn first_connection_pairs_with_matching_codes_and_pins_both() {
+    let (pc, mac) = (Side::new("desk"), Side::new("macbook"));
+    let (client, server) = run(&pc, &mac);
+    assert!(client.unwrap().1.newly_paired);
+    assert!(server.unwrap().1.newly_paired);
+
+    let (pc_req, mac_req) = (pc.requests(), mac.requests());
+    assert_eq!(pc_req.len(), 1);
+    assert_eq!(mac_req.len(), 1);
+    assert_eq!(
+        pc_req[0].code, mac_req[0].code,
+        "both screens show the same code"
+    );
+    assert_eq!(pc_req[0].code.len(), 7);
+    assert_eq!(pc_req[0].peer_name, "macbook");
+    assert_eq!(pc_req[0].peer_fingerprint, mac.identity.fingerprint());
+    assert_eq!(mac_req[0].peer_name, "desk");
+
+    // Pinned now: the next connection is silent.
+    let (client, server) = run(&pc, &mac);
+    assert!(!client.unwrap().1.newly_paired);
+    assert!(!server.unwrap().1.newly_paired);
+    assert_eq!(pc.requests().len(), 1);
+}
+
+#[test]
+fn codes_differ_between_sessions() {
+    let (pc, mac) = (Side::new("desk"), Side::new("macbook"));
+    let mut mac_no = Side::new("macbook");
+    mac_no.answer = false;
+    let _ = run(&pc, &mac_no);
+    let _ = run(&pc, &mac);
+    let codes: Vec<_> = pc.requests().into_iter().map(|r| r.code).collect();
+    assert_eq!(codes.len(), 2);
+    assert_ne!(codes[0], codes[1]);
+}
+
+#[test]
+fn declined_on_either_side_pins_nothing() {
+    for decline_on_pc in [true, false] {
+        let (mut pc, mut mac) = (Side::new("desk"), Side::new("macbook"));
+        if decline_on_pc {
+            pc.answer = false;
+        } else {
+            mac.answer = false;
+        }
+        let (client, server) = run(&pc, &mac);
+        let (client, server) = (client.unwrap_err(), server.unwrap_err());
+        assert!(
+            matches!(client, Error::Declined { by_peer } if by_peer != decline_on_pc),
+            "{client:?}"
+        );
+        assert!(
+            matches!(server, Error::Declined { by_peer } if by_peer == decline_on_pc),
+            "{server:?}"
+        );
+        assert!(pc.trust.lock().unwrap().peers().is_empty());
+        assert!(mac.trust.lock().unwrap().peers().is_empty());
+    }
+}
+
+#[test]
+fn unknown_peer_is_refused_when_the_mac_is_not_pairing() {
+    let (pc, mut mac) = (Side::new("desk"), Side::new("macbook"));
+    mac.can_pair = false;
+    let (client, server) = run(&pc, &mac);
+    assert!(matches!(
+        client.unwrap_err(),
+        Error::NotPairing { here: false }
+    ));
+    assert!(matches!(
+        server.unwrap_err(),
+        Error::NotPairing { here: true }
+    ));
+    assert!(pc.requests().is_empty() && mac.requests().is_empty());
+}
+
+#[test]
+fn pinned_name_with_a_different_key_fails_hard() {
+    let (pc, mac) = (Side::new("desk"), Side::new("macbook"));
+    let impostor = Side::new("macbook");
+    pc.pin(&mac);
+    impostor.pin(&pc);
+    let (client, server) = run(&pc, &impostor);
+    assert!(matches!(client.unwrap_err(), Error::KeyChanged { ref name } if name == "macbook"));
+    assert!(matches!(server.unwrap_err(), Error::PeerKeyChanged { .. }));
+    assert!(pc.requests().is_empty(), "never offers to re-pair");
+    assert_eq!(
+        pc.trust.lock().unwrap().peers()[0].key,
+        *mac.identity.public_key(),
+        "old key kept"
+    );
+}
+
+/// The mac says "I know you" (trust 0), honestly or not: the PC hasn't
+/// pinned it, so the PC's own user must still confirm. The peer's trust byte
+/// never loosens our decision.
+#[test]
+fn peer_claiming_trust_does_not_skip_our_confirmation() {
+    let (pc, mac) = (Side::new("desk"), Side::new("macbook"));
+    mac.pin(&pc);
+    let (client, server) = run(&pc, &mac);
+    client.unwrap();
+    server.unwrap();
+    assert_eq!(pc.requests().len(), 1);
+    assert_eq!(mac.requests().len(), 1);
+
+    // Same with our user declining: nothing gets pinned on our side.
+    let (mut pc, mac) = (Side::new("desk"), Side::new("macbook"));
+    pc.answer = false;
+    mac.pin(&pc);
+    let (client, _) = run(&pc, &mac);
+    assert!(matches!(
+        client.unwrap_err(),
+        Error::Declined { by_peer: false }
+    ));
+    assert!(pc.trust.lock().unwrap().peers().is_empty());
+}
+
+#[test]
+fn renamed_peer_with_a_known_key_connects_and_updates_the_name() {
+    let (pc, mac) = (Side::new("desk"), Side::new("macbook"));
+    pc.pin(&mac);
+    mac.pin(&pc);
+    let paired_at = pc.trust.lock().unwrap().peers()[0].paired_at;
+    let renamed = Side {
+        identity: mac.identity,
+        trust: mac.trust,
+        ..Side::new("jow's MacBook Air")
+    };
+    let (client, server) = run(&pc, &renamed);
+    assert_eq!(client.unwrap().1.name, "jow's MacBook Air");
+    server.unwrap();
+    let peers = pc.trust.lock().unwrap().peers().to_vec();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].name, "jow's MacBook Air");
+    assert_eq!(peers[0].paired_at, paired_at);
+}
+
+#[test]
+fn slow_confirmation_times_out() {
+    let (pc, mut mac) = (Side::new("desk"), Side::new("macbook"));
+    // Well past the 500 ms limit: Windows receive timeouts can overshoot.
+    mac.delay = Duration::from_secs(2);
+    let (client, server) = run(&pc, &mac);
+    let client = client.unwrap_err();
+    assert!(matches!(client, Error::PairingTimeout), "{client:?}");
+    assert!(matches!(
+        server.unwrap_err(),
+        Error::Declined { by_peer: false } | Error::Io(_)
+    ));
+    assert!(pc.trust.lock().unwrap().peers().is_empty());
+    assert!(mac.trust.lock().unwrap().peers().is_empty());
+}
+
+#[test]
+fn garbage_instead_of_a_handshake_is_rejected() {
+    let mac = Side::new("macbook");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = thread::spawn(move || {
+        use std::io::Write;
+        let mut s = TcpStream::connect(addr).unwrap();
+        // A plaintext v1 Hello frame.
+        s.write_all(&[6, 0, 0, 0, 0, 1, 1, b'w', 1, 0]).unwrap();
+        thread::sleep(Duration::from_millis(200));
+    });
+    let err = mac.run(listener.accept().unwrap().0, false).unwrap_err();
+    assert!(matches!(err, Error::Noise(_) | Error::Io(_)), "{err:?}");
+    client.join().unwrap();
+}
+
+#[test]
+fn pairing_request_carries_a_deadline() {
+    let (pc, mac) = (Side::new("desk"), Side::new("macbook"));
+    let before = std::time::Instant::now();
+    let (client, server) = run(&pc, &mac);
+    client.unwrap();
+    server.unwrap();
+    let deadline = pc.requests()[0].deadline;
+    assert!(deadline > before);
+    assert!(deadline <= before + Duration::from_secs(2));
+}
+
+#[test]
+fn only_one_pairing_at_a_time() {
+    let (pc, mac) = (Side::new("desk"), Side::new("macbook"));
+    let _busy = mac.slot.try_take().unwrap();
+    let (client, server) = run(&pc, &mac);
+    assert!(matches!(server.unwrap_err(), Error::PairingBusy));
+    assert!(client.is_err());
+    assert!(mac.requests().is_empty() && pc.requests().is_empty());
+}
+
+#[test]
+fn a_peer_trickling_bytes_cannot_stretch_the_handshake() {
+    let mac = Side::new("macbook");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let trickle = {
+        let stop = std::sync::Arc::clone(&stop);
+        thread::spawn(move || {
+            use std::io::Write;
+            let mut s = TcpStream::connect(addr).unwrap();
+            // A plausible length, then one byte every 50 ms.
+            let _ = s.write_all(&[0, 32]);
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                if s.write_all(&[0]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        })
+    };
+    let identity = &mac.identity;
+    let opts = Options {
+        handshake_timeout: Duration::from_millis(400),
+        ..Options::new(identity, mac.name, &mac.trust)
+    };
+    let started = std::time::Instant::now();
+    let err = onemouse_transport::accept(listener.accept().unwrap().0, &opts).unwrap_err();
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(matches!(err, Error::HandshakeTimeout), "{err:?}");
+    // Generous for slow CI; a per-read timeout would take 32 × 400 ms.
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    trickle.join().unwrap();
+}
+
+#[test]
+fn names_are_sanitized_before_anyone_sees_them() {
+    let pc = Side::new("desk");
+    let mac = Side::new("mac\u{202E}koob\u{1}");
+    let (client, server) = run(&pc, &mac);
+    assert_eq!(client.unwrap().1.name, "mackoob");
+    server.unwrap();
+    assert_eq!(pc.requests()[0].peer_name, "mackoob");
+    assert_eq!(pc.trust.lock().unwrap().peers()[0].name, "mackoob");
+}
