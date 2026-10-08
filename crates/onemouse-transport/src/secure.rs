@@ -5,7 +5,7 @@
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use snow::StatelessTransportState;
 
@@ -24,6 +24,9 @@ pub struct SecureReader<S> {
     plain: Vec<u8>,
     plain_len: usize,
     pos: usize,
+    /// Set after any error: the stream may be mid-record, so it stays
+    /// unusable rather than risk misreading.
+    failed: bool,
 }
 
 /// Encrypting half. Each `write` call becomes one record (split at
@@ -33,6 +36,8 @@ pub struct SecureWriter<S> {
     state: Arc<StatelessTransportState>,
     nonce: u64,
     out: Vec<u8>,
+    /// Set after any error (a record may be half written).
+    failed: bool,
 }
 
 pub(crate) fn halves<R, W>(
@@ -50,12 +55,14 @@ pub(crate) fn halves<R, W>(
             plain: vec![0; MAX_RECORD],
             plain_len: 0,
             pos: 0,
+            failed: false,
         },
         SecureWriter {
             inner: writer,
             state,
             nonce: 0,
             out: vec![0; 2 + MAX_RECORD],
+            failed: false,
         },
     )
 }
@@ -64,33 +71,113 @@ fn bad_data(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what.to_owned())
 }
 
+fn failed_earlier() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        "secure stream unusable after an earlier error",
+    )
+}
+
+/// Reads one record from `src` into `plain`. `Ok(None)` on a clean EOF (at a
+/// record boundary); EOF anywhere else is `UnexpectedEof`.
+fn read_record_from(
+    src: &mut impl Read,
+    state: &StatelessTransportState,
+    nonce: &mut u64,
+    record: &mut [u8],
+    plain: &mut [u8],
+) -> io::Result<Option<usize>> {
+    let mut len = [0; 2];
+    loop {
+        match src.read(&mut len[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(_) => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    src.read_exact(&mut len[1..])?;
+    let len = u16::from_be_bytes(len) as usize;
+    if len < TAG_LEN {
+        return Err(bad_data("record shorter than its authentication tag"));
+    }
+    src.read_exact(&mut record[..len])?;
+    let n = state
+        .read_message(*nonce, &record[..len], plain)
+        .map_err(|_| bad_data("record failed authentication"))?;
+    *nonce += 1;
+    Ok(Some(n))
+}
+
+/// Reads from a socket, giving up once `deadline` passes, however slowly the
+/// peer trickles bytes in: every `read` call gets only the time left.
+struct DeadlineReader<'a> {
+    tcp: &'a TcpStream,
+    deadline: Instant,
+}
+
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "deadline passed"))?;
+        self.tcp.set_read_timeout(Some(left))?;
+        let mut tcp = self.tcp;
+        tcp.read(buf)
+    }
+}
+
+/// Reads `buf.len()` bytes from `tcp` before `deadline`.
+pub(crate) fn read_exact_by(tcp: &TcpStream, buf: &mut [u8], deadline: Instant) -> io::Result<()> {
+    DeadlineReader { tcp, deadline }.read_exact(buf)
+}
+
 impl SecureReader<TcpStream> {
     /// See [`SecureStream::set_read_timeout`].
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.inner.set_read_timeout(timeout)
+    }
+
+    /// [`SecureReader::read_record`], but the whole record must arrive
+    /// before `deadline`. Leaves a read timeout set on the socket; callers
+    /// set their own afterwards.
+    pub(crate) fn read_record_by(&mut self, deadline: Instant) -> io::Result<Option<&[u8]>> {
+        if self.failed {
+            return Err(failed_earlier());
+        }
+        let mut src = DeadlineReader {
+            tcp: &self.inner,
+            deadline,
+        };
+        let result = read_record_from(
+            &mut src,
+            &self.state,
+            &mut self.nonce,
+            &mut self.record,
+            &mut self.plain,
+        );
+        self.failed = result.is_err();
+        Ok(result?.map(|n| &self.plain[..n]))
     }
 }
 
 impl<S: Read> SecureReader<S> {
     /// Reads and decrypts one whole record. `Ok(None)` on a clean EOF.
     pub(crate) fn read_record(&mut self) -> io::Result<Option<&[u8]>> {
-        let mut len = [0; 2];
-        match self.inner.read_exact(&mut len) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e),
+        if self.failed {
+            return Err(failed_earlier());
         }
-        let len = u16::from_be_bytes(len) as usize;
-        if len < TAG_LEN {
-            return Err(bad_data("record shorter than its authentication tag"));
-        }
-        self.inner.read_exact(&mut self.record[..len])?;
-        let n = self
-            .state
-            .read_message(self.nonce, &self.record[..len], &mut self.plain)
-            .map_err(|_| bad_data("record failed authentication"))?;
-        self.nonce += 1;
-        Ok(Some(&self.plain[..n]))
+        let result = read_record_from(
+            &mut self.inner,
+            &self.state,
+            &mut self.nonce,
+            &mut self.record,
+            &mut self.plain,
+        );
+        self.failed = result.is_err();
+        Ok(result?.map(|n| &self.plain[..n]))
     }
 
     /// Bytes decrypted but not yet consumed.
@@ -126,13 +213,19 @@ impl<S: Write> SecureWriter<S> {
     /// Encrypts `plain` (at most [`MAX_PLAINTEXT`] bytes) as one record.
     pub(crate) fn write_record(&mut self, plain: &[u8]) -> io::Result<()> {
         debug_assert!(plain.len() <= MAX_PLAINTEXT);
+        if self.failed {
+            return Err(failed_earlier());
+        }
+        self.failed = true;
         let n = self
             .state
             .write_message(self.nonce, plain, &mut self.out[2..])
             .map_err(|e| io::Error::other(format!("encryption failed: {e}")))?;
         self.nonce += 1;
         self.out[..2].copy_from_slice(&(n as u16).to_be_bytes());
-        self.inner.write_all(&self.out[..2 + n])
+        self.inner.write_all(&self.out[..2 + n])?;
+        self.failed = false;
+        Ok(())
     }
 
     pub fn get_ref(&self) -> &S {
@@ -290,6 +383,30 @@ mod tests {
         assert_eq!(&buf, b"one");
         let err = reader.read_exact(&mut buf).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn partial_length_header_is_an_error_not_eof() {
+        let (wire, r) = encrypt(&[b"press A"]);
+        let err = reader(wire[..1].to_vec(), r)
+            .read_to_end(&mut Vec::new())
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        // An empty stream is a clean EOF, though.
+        let (_, r) = encrypt(&[]);
+        assert_eq!(reader(Vec::new(), r).read(&mut [0; 4]).unwrap(), 0);
+    }
+
+    #[test]
+    fn errors_are_sticky() {
+        let (mut wire, r) = encrypt(&[b"one", b"two"]);
+        wire[2] ^= 0x01; // Corrupt the first record only.
+        let mut stream = reader(wire, r);
+        let first = stream.read(&mut [0; 8]).unwrap_err();
+        assert_eq!(first.kind(), io::ErrorKind::InvalidData);
+        // The second record is intact, but the stream stays failed.
+        let again = stream.read(&mut [0; 8]).unwrap_err();
+        assert_eq!(again.kind(), io::ErrorKind::BrokenPipe);
     }
 
     #[test]

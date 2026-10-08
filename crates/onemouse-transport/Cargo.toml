@@ -7,8 +7,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-onemouse-protocol.workspace = true
+blake2 = "0.10.6"
+getrandom = "0.3.4"
 mdns-sd = "0.21.5"
+onemouse-protocol.workspace = true
 # Only the primitives we use (pure Rust). snow's `std` feature would pull in
 # `ring` unconditionally.
 snow = { version = "0.10.0", default-features = false, features = [
@@ -17,6 +19,15 @@ snow = { version = "0.10.0", default-features = false, features = [
     "use-chacha20poly1305",
     "use-curve25519",
     "use-getrandom",
+] }
+subtle = "2.6.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
 ] }
 
 [dev-dependencies]

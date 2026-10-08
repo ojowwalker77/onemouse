@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use onemouse_protocol::{Message, read_message, write_message};
 use onemouse_transport::{
-    Error, Identity, Options, PairingRequest, Peer, SecureStream, TrustStore,
+    Error, Identity, Options, PairingRequest, PairingSlot, Peer, SecureStream, TrustStore,
 };
 
 struct Side {
@@ -18,6 +18,8 @@ struct Side {
     answer: bool,
     delay: Duration,
     seen: Mutex<Vec<PairingRequest>>,
+    /// Per side: tests run in parallel in one process.
+    slot: PairingSlot,
 }
 
 impl Side {
@@ -30,6 +32,7 @@ impl Side {
             answer: true,
             delay: Duration::ZERO,
             seen: Mutex::new(Vec::new()),
+            slot: PairingSlot::new(),
         }
     }
 
@@ -51,6 +54,7 @@ impl Side {
             can_pair: self.can_pair,
             confirm: &confirm,
             pairing_timeout: Duration::from_millis(500),
+            pairing_slot: &self.slot,
             ..Options::new(&self.identity, self.name, &self.trust)
         };
         if initiator {
@@ -277,4 +281,76 @@ fn garbage_instead_of_a_handshake_is_rejected() {
     let err = mac.run(listener.accept().unwrap().0, false).unwrap_err();
     assert!(matches!(err, Error::Noise(_) | Error::Io(_)), "{err:?}");
     client.join().unwrap();
+}
+
+#[test]
+fn pairing_request_carries_a_deadline() {
+    let (pc, mac) = (Side::new("desk"), Side::new("macbook"));
+    let before = std::time::Instant::now();
+    let (client, server) = run(&pc, &mac);
+    client.unwrap();
+    server.unwrap();
+    let deadline = pc.requests()[0].deadline;
+    assert!(deadline > before);
+    assert!(deadline <= before + Duration::from_secs(2));
+}
+
+#[test]
+fn only_one_pairing_at_a_time() {
+    let (pc, mac) = (Side::new("desk"), Side::new("macbook"));
+    let _busy = mac.slot.try_take().unwrap();
+    let (client, server) = run(&pc, &mac);
+    assert!(matches!(server.unwrap_err(), Error::PairingBusy));
+    assert!(client.is_err());
+    assert!(mac.requests().is_empty() && pc.requests().is_empty());
+}
+
+#[test]
+fn a_peer_trickling_bytes_cannot_stretch_the_handshake() {
+    let mac = Side::new("macbook");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let trickle = {
+        let stop = std::sync::Arc::clone(&stop);
+        thread::spawn(move || {
+            use std::io::Write;
+            let mut s = TcpStream::connect(addr).unwrap();
+            // A plausible length, then one byte every 50 ms.
+            let _ = s.write_all(&[0, 32]);
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                if s.write_all(&[0]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        })
+    };
+    let identity = &mac.identity;
+    let opts = Options {
+        handshake_timeout: Duration::from_millis(400),
+        ..Options::new(identity, mac.name, &mac.trust)
+    };
+    let started = std::time::Instant::now();
+    let err = onemouse_transport::accept(listener.accept().unwrap().0, &opts).unwrap_err();
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(matches!(err, Error::HandshakeTimeout), "{err:?}");
+    // Generous for slow CI; a per-read timeout would take 32 × 400 ms.
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    trickle.join().unwrap();
+}
+
+#[test]
+fn names_are_sanitized_before_anyone_sees_them() {
+    let pc = Side::new("desk");
+    let mac = Side::new("mac\u{202E}koob\u{1}");
+    let (client, server) = run(&pc, &mac);
+    assert_eq!(client.unwrap().1.name, "mackoob");
+    server.unwrap();
+    assert_eq!(pc.requests()[0].peer_name, "mackoob");
+    assert_eq!(pc.trust.lock().unwrap().peers()[0].name, "mackoob");
 }
