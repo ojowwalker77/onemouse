@@ -504,10 +504,14 @@ dependencies = [
 name = "onemouse-transport"
 version = "0.1.0"
 dependencies = [
+ "blake2",
+ "getrandom 0.3.4",
  "mdns-sd",
  "onemouse-protocol",
  "snow",
+ "subtle",
  "tempfile",
+ "windows-sys",
 ]
 
 [[package]]

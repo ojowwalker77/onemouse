@@ -1,7 +1,6 @@
 //! mDNS: the primary advertises [`SERVICE_TYPE`] with its name and key
 //! fingerprint, the secondary browses for it.
 
-use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
@@ -40,7 +39,8 @@ impl Drop for Advertisement {
 pub fn advertise(name: &str, fingerprint: &str, port: u16) -> Result<Advertisement, Error> {
     let daemon = ServiceDaemon::new()?;
     let host = format!("onemouse-{fingerprint}.local.");
-    let instance = format!("{name} ({})", &fingerprint[..fingerprint.len().min(8)]);
+    let short: String = fingerprint.chars().take(8).collect();
+    let instance = format!("{name} ({short})");
     let version = PROTOCOL_VERSION.to_string();
     let props = [("fp", fingerprint), ("name", name), ("v", &version)];
     let info =
@@ -50,14 +50,22 @@ pub fn advertise(name: &str, fingerprint: &str, port: u16) -> Result<Advertiseme
     Ok(Advertisement { daemon, fullname })
 }
 
-/// Browses for primaries for up to `timeout`. Returns early as soon as one
-/// matches `want` (a fingerprint) and speaks our protocol version. Callers
-/// should skip entries whose `version` isn't ours.
+/// How long [`browse`] keeps listening after `want` turned up.
+const MATCH_GRACE: Duration = Duration::from_millis(500);
+
+/// Browses for primaries for up to `timeout`, or until shortly after one
+/// matching `want` (a fingerprint, speaking our protocol version) shows up.
+///
+/// Returns **every** distinct answer, including several claiming the same
+/// fingerprint (anyone can advertise a public fingerprint): callers should
+/// try each matching candidate in turn and let the handshake tell the real
+/// one apart, and skip entries whose `version` isn't ours.
 pub fn browse(timeout: Duration, want: Option<&str>) -> Result<Vec<Found>, Error> {
     let daemon = ServiceDaemon::new()?;
     let events = daemon.browse(SERVICE_TYPE)?;
     let deadline = Instant::now() + timeout;
-    let mut found: HashMap<String, Found> = HashMap::new();
+    let mut deadline = deadline;
+    let mut found: Vec<Found> = Vec::new();
     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
         let Ok(event) = events.recv_timeout(left) else {
             break;
@@ -85,15 +93,19 @@ pub fn browse(timeout: Duration, want: Option<&str>) -> Result<Vec<Found>, Error
                 port: service.port,
             };
             let matched = want == Some(fp) && entry.version == Some(PROTOCOL_VERSION);
-            found.insert(service.fullname.clone(), entry);
+            // Every distinct answer is kept: a spoofer advertising the same
+            // name or fingerprint must not hide the real one.
+            if !found.contains(&entry) {
+                found.push(entry);
+            }
             if matched {
-                break;
+                // Keep listening briefly for competing answers.
+                deadline = deadline.min(Instant::now() + MATCH_GRACE);
             }
         }
     }
     let _ = daemon.stop_browse(SERVICE_TYPE);
     let _ = daemon.shutdown();
-    let mut found: Vec<_> = found.into_values().collect();
     found.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(found)
 }

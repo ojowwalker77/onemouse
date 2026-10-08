@@ -1,17 +1,21 @@
 //! Noise XX handshake, trust exchange and pairing. The wire format is
 //! documented at the crate root.
 
+use std::cell::Cell;
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::net::TcpStream;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use blake2::{Blake2s256, Digest};
 use snow::HandshakeState;
+use subtle::ConstantTimeEq;
 
 use crate::identity::{Identity, PublicKey, fingerprint};
-use crate::secure::{SecureStream, halves};
-use crate::trust::{Trust, TrustStore};
+use crate::secure::{SecureStream, halves, read_exact_by};
+use crate::trust::{Trust, TrustStore, sanitize_name};
 use crate::{NOISE_PARAMS, PROLOGUE};
 
 /// Longest device name carried in the handshake.
@@ -20,16 +24,20 @@ pub const MAX_NAME_LEN: usize = 255;
 /// Shown to the user when a new device wants to pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairingRequest {
+    /// Sanitized: no control characters or bidi overrides.
     pub peer_name: String,
     pub peer_fingerprint: String,
     /// Six digits, e.g. `"042 917"`. Same on both devices unless someone is
     /// in the middle.
     pub code: String,
+    /// After this the pairing fails anyway: close the dialog.
+    pub deadline: Instant,
 }
 
 /// The authenticated peer of an established connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Peer {
+    /// Sanitized, like in [`PairingRequest`].
     pub name: String,
     pub key: PublicKey,
     /// Whether it was paired during this handshake.
@@ -42,6 +50,38 @@ impl Peer {
     }
 }
 
+/// Allows one pairing at a time, so a device in pairing mode can't be
+/// flooded with confirmation dialogs showing different codes.
+#[derive(Debug, Default)]
+pub struct PairingSlot(AtomicBool);
+
+/// Holds a [`PairingSlot`] until dropped.
+#[derive(Debug)]
+pub struct PairingGuard<'a>(&'a PairingSlot);
+
+impl PairingSlot {
+    pub const fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    /// `None` if a pairing is already in progress.
+    pub fn try_take(&self) -> Option<PairingGuard<'_>> {
+        self.0
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| PairingGuard(self))
+    }
+}
+
+impl Drop for PairingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.0.store(false, Ordering::Release);
+    }
+}
+
+/// The process-wide slot [`Options::new`] uses.
+pub static PAIRING_SLOT: PairingSlot = PairingSlot::new();
+
 pub struct Options<'a> {
     pub identity: &'a Identity,
     /// This device's name, sent to the peer.
@@ -51,12 +91,16 @@ pub struct Options<'a> {
     /// the primary: only while the user has pairing mode open).
     pub can_pair: bool,
     /// Asks the user whether the code matches the other screen. Called on
-    /// the handshake's thread; may block until the user answers.
+    /// the handshake's thread; may block until the user answers (answers
+    /// after [`PairingRequest::deadline`] count as "no").
     pub confirm: &'a (dyn Fn(&PairingRequest) -> bool + Sync),
-    /// Limit for the Noise handshake and trust exchange.
+    /// Limit for everything automatic: Noise handshake, trust exchange and
+    /// the pairing-code exchange, however slowly the peer sends.
     pub handshake_timeout: Duration,
     /// Limit for both users to confirm the code.
     pub pairing_timeout: Duration,
+    /// Only one pairing at a time may hold this.
+    pub pairing_slot: &'a PairingSlot,
 }
 
 impl<'a> Options<'a> {
@@ -70,6 +114,7 @@ impl<'a> Options<'a> {
             confirm: &|_| false,
             handshake_timeout: Duration::from_secs(10),
             pairing_timeout: Duration::from_secs(60),
+            pairing_slot: &PAIRING_SLOT,
         }
     }
 }
@@ -79,6 +124,8 @@ pub enum Error {
     Io(io::Error),
     Noise(snow::Error),
     Protocol(String),
+    /// The handshake (before any user interaction) took too long.
+    HandshakeTimeout,
     /// We have `name` pinned to a different key. Possibly an impostor;
     /// the user must forget the old pairing deliberately.
     KeyChanged {
@@ -94,6 +141,11 @@ pub enum Error {
     NotPairing {
         here: bool,
     },
+    /// Another pairing is already waiting for the user here.
+    PairingBusy,
+    /// The peer's revealed pairing nonce doesn't match its commitment: it
+    /// tried to choose the code. Treat as an attack.
+    CommitmentMismatch,
     /// A user said the codes don't match (or didn't answer in time).
     Declined {
         by_peer: bool,
@@ -108,6 +160,7 @@ impl fmt::Display for Error {
             Self::Io(e) => write!(f, "{e}"),
             Self::Noise(e) => write!(f, "handshake failed: {e}"),
             Self::Protocol(what) => write!(f, "protocol error: {what}"),
+            Self::HandshakeTimeout => write!(f, "handshake timed out"),
             Self::KeyChanged { name } => write!(
                 f,
                 "{name} presented a different key than the one paired with this device. \
@@ -122,6 +175,11 @@ impl fmt::Display for Error {
             Self::NotPairing { here: false } => {
                 write!(f, "the other device isn't in pairing mode")
             }
+            Self::PairingBusy => write!(f, "another pairing is already in progress"),
+            Self::CommitmentMismatch => write!(
+                f,
+                "the other device cheated in the pairing-code exchange; someone may be in the middle"
+            ),
             Self::Declined { by_peer: false } => write!(f, "pairing declined here"),
             Self::Declined { by_peer: true } => write!(f, "pairing declined on the other device"),
             Self::PairingTimeout => write!(f, "pairing timed out"),
@@ -143,6 +201,10 @@ impl From<snow::Error> for Error {
     }
 }
 
+fn is_timeout(e: &Error) -> bool {
+    matches!(e, Error::Io(e) if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock))
+}
+
 /// Secondary side: we initiate.
 pub fn connect(stream: TcpStream, opts: &Options) -> Result<(SecureStream, Peer), Error> {
     establish(stream, opts, true)
@@ -159,8 +221,8 @@ fn establish(
     initiator: bool,
 ) -> Result<(SecureStream, Peer), Error> {
     let previous_timeout = stream.read_timeout()?;
-    stream.set_read_timeout(Some(opts.handshake_timeout))?;
-    let (secure, peer) = establish_inner(stream, opts, initiator)?;
+    let deadline = Instant::now() + opts.handshake_timeout;
+    let (secure, peer) = establish_inner(stream, opts, initiator, deadline)?;
     // Best effort: macOS returns EINVAL for setsockopt once the peer has
     // closed, and the handshake's own result matters more.
     let _ = secure.set_read_timeout(previous_timeout);
@@ -171,7 +233,15 @@ fn establish_inner(
     mut stream: TcpStream,
     opts: &Options,
     initiator: bool,
+    deadline: Instant,
 ) -> Result<(SecureStream, Peer), Error> {
+    let timeout = |e: Error| {
+        if is_timeout(&e) {
+            Error::HandshakeTimeout
+        } else {
+            e
+        }
+    };
     let name = opts.name.as_bytes();
     let name = &name[..floor_char_boundary(opts.name, MAX_NAME_LEN.min(name.len()))];
     let builder = snow::Builder::new(NOISE_PARAMS.parse()?)
@@ -182,23 +252,29 @@ fn establish_inner(
     let (hs, peer_name) = if initiator {
         let mut hs = builder.build_initiator()?;
         send_handshake(&mut stream, &mut hs, &[])?;
-        let peer_name = recv_handshake(&mut stream, &mut hs)?;
+        let peer_name = recv_handshake(&stream, &mut hs, deadline).map_err(timeout)?;
         send_handshake(&mut stream, &mut hs, name)?;
         (hs, peer_name)
     } else {
         let mut hs = builder.build_responder()?;
-        recv_handshake(&mut stream, &mut hs)?;
+        recv_handshake(&stream, &mut hs, deadline).map_err(timeout)?;
         send_handshake(&mut stream, &mut hs, name)?;
-        let peer_name = recv_handshake(&mut stream, &mut hs)?;
+        let peer_name = recv_handshake(&stream, &mut hs, deadline).map_err(timeout)?;
         (hs, peer_name)
     };
-    let peer_name = String::from_utf8(peer_name)
-        .map_err(|_| Error::Protocol("peer name is not UTF-8".into()))?;
+    // Sanitized once, here: the store, the dialog and `Peer` all see the same.
+    let peer_name = sanitize_name(
+        &String::from_utf8(peer_name)
+            .map_err(|_| Error::Protocol("peer name is not UTF-8".into()))?,
+    );
     let key: PublicKey = hs
         .get_remote_static()
         .and_then(|k| k.try_into().ok())
         .ok_or_else(|| Error::Protocol("no remote static key".into()))?;
-    let code = pairing_code(hs.get_handshake_hash());
+    let hash: [u8; 32] = hs
+        .get_handshake_hash()
+        .try_into()
+        .map_err(|_| Error::Protocol("unexpected handshake hash length".into()))?;
     let state = hs.into_stateless_transport_mode()?;
     // The reader keeps the original handle: on Windows, socket options such
     // as the read timeout aren't shared with `try_clone`d handles.
@@ -206,7 +282,15 @@ fn establish_inner(
     let (reader, writer) = halves(state, stream, writer);
     let mut secure = SecureStream { reader, writer };
 
-    let newly_paired = exchange_trust(&mut secure, opts, &peer_name, &key, code)?;
+    let newly_paired = exchange_trust(
+        &mut secure,
+        opts,
+        initiator,
+        &peer_name,
+        &key,
+        &hash,
+        deadline,
+    )?;
     Ok((
         secure,
         Peer {
@@ -231,9 +315,11 @@ const TRUST_KEY_CHANGED: u8 = 2;
 fn exchange_trust(
     secure: &mut SecureStream,
     opts: &Options,
+    initiator: bool,
     peer_name: &str,
     key: &PublicKey,
-    code: String,
+    hash: &[u8; 32],
+    deadline: Instant,
 ) -> Result<bool, Error> {
     let trust = opts
         .trust
@@ -246,8 +332,7 @@ fn exchange_trust(
         Trust::KeyChanged => TRUST_KEY_CHANGED,
     };
     secure.writer.write_record(&[ours, opts.can_pair.into()])?;
-    let theirs = read_record(secure)?;
-    let &[theirs, peer_can_pair] = theirs.as_slice() else {
+    let &[theirs, peer_can_pair] = read_record(secure, deadline)?.as_slice() else {
         return Err(Error::Protocol("malformed trust record".into()));
     };
     if theirs > TRUST_KEY_CHANGED || peer_can_pair > 1 {
@@ -283,35 +368,26 @@ fn exchange_trust(
         return Err(Error::NotPairing { here: false });
     }
 
-    // Pairing: both users compare the code, each side sends one record.
-    let started = Instant::now();
+    // Pairing. One at a time here; the other side notices us closing.
+    let _slot = opts.pairing_slot.try_take().ok_or(Error::PairingBusy)?;
+    let code = exchange_code(secure, initiator, hash, deadline)?;
+
+    // Both users compare the code; each side sends one record.
+    let pairing_deadline = Instant::now() + opts.pairing_timeout;
     let request = PairingRequest {
         peer_name: peer_name.into(),
         peer_fingerprint: fingerprint(key),
         code,
+        deadline: pairing_deadline,
     };
-    let accepted = (opts.confirm)(&request) && started.elapsed() < opts.pairing_timeout;
+    let accepted = (opts.confirm)(&request) && Instant::now() < pairing_deadline;
     secure.writer.write_record(&[accepted.into()])?;
     if !accepted {
         return Err(Error::Declined { by_peer: false });
     }
-    let remaining = opts
-        .pairing_timeout
-        .saturating_sub(started.elapsed())
-        .max(Duration::from_millis(1));
-    // Best effort (see `establish`): if the peer already closed, the read
-    // below reports it, e.g. after its `[0]`.
-    let _ = secure.set_read_timeout(Some(remaining));
-    let answer = match read_record(secure) {
+    let answer = match read_record(secure, pairing_deadline) {
         Ok(answer) => answer,
-        Err(Error::Io(e))
-            if matches!(
-                e.kind(),
-                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-            ) =>
-        {
-            return Err(Error::PairingTimeout);
-        }
+        Err(e) if is_timeout(&e) => return Err(Error::PairingTimeout),
         Err(e) => return Err(e),
     };
     match answer.as_slice() {
@@ -326,21 +402,95 @@ fn exchange_trust(
     Ok(true)
 }
 
-fn read_record(secure: &mut SecureStream) -> Result<Vec<u8>, Error> {
-    match secure.reader.read_record()? {
+/// Commit-then-reveal, so neither side (nor a man in the middle running two
+/// handshakes) can choose its input after seeing the other's:
+/// initiator → `C = H("onemouse-sas-commit" ‖ h ‖ Ni)`, responder → `Nr`,
+/// initiator → `Ni` (checked against `C`). The code is
+/// `H("onemouse-sas" ‖ h ‖ Ni ‖ Nr)`.
+fn exchange_code(
+    secure: &mut SecureStream,
+    initiator: bool,
+    hash: &[u8; 32],
+    deadline: Instant,
+) -> Result<String, Error> {
+    let read32 = |secure: &mut SecureStream| -> Result<[u8; 32], Error> {
+        match read_record(secure, deadline) {
+            Ok(record) => record
+                .try_into()
+                .map_err(|_| Error::Protocol("malformed pairing-code record".into())),
+            Err(e) if is_timeout(&e) => Err(Error::HandshakeTimeout),
+            Err(e) => Err(e),
+        }
+    };
+    if initiator {
+        let ni = random_nonce()?;
+        secure.writer.write_record(&commitment(hash, &ni))?;
+        let nr = read32(secure)?;
+        secure.writer.write_record(&revealed(ni))?;
+        Ok(pairing_code(hash, &ni, &nr))
+    } else {
+        let committed = read32(secure)?;
+        let nr = random_nonce()?;
+        secure.writer.write_record(&nr)?;
+        let ni = read32(secure)?;
+        if !bool::from(commitment(hash, &ni).ct_eq(&committed)) {
+            return Err(Error::CommitmentMismatch);
+        }
+        Ok(pairing_code(hash, &ni, &nr))
+    }
+}
+
+fn random_nonce() -> Result<[u8; 32], Error> {
+    let mut nonce = [0; 32];
+    getrandom::fill(&mut nonce)
+        .map_err(|e| Error::Io(io::Error::other(format!("no randomness: {e}"))))?;
+    Ok(nonce)
+}
+
+fn commitment(hash: &[u8; 32], ni: &[u8; 32]) -> [u8; 32] {
+    Blake2s256::new()
+        .chain_update(b"onemouse-sas-commit")
+        .chain_update(hash)
+        .chain_update(ni)
+        .finalize()
+        .into()
+}
+
+/// Six decimal digits, e.g. `"042 917"`, from the final handshake hash `h`
+/// (which binds both static keys) and both commit-reveal nonces.
+pub fn pairing_code(hash: &[u8; 32], ni: &[u8; 32], nr: &[u8; 32]) -> String {
+    let digest: [u8; 32] = Blake2s256::new()
+        .chain_update(b"onemouse-sas")
+        .chain_update(hash)
+        .chain_update(ni)
+        .chain_update(nr)
+        .finalize()
+        .into();
+    let n = u64::from_be_bytes(digest[..8].try_into().expect("32-byte digest")) % 1_000_000;
+    format!("{:03} {:03}", n / 1000, n % 1000)
+}
+
+thread_local! {
+    /// Test hook: make this thread's initiator reveal a different nonce
+    /// than it committed to.
+    static CHEAT_REVEAL: Cell<bool> = const { Cell::new(false) };
+}
+
+fn revealed(mut ni: [u8; 32]) -> [u8; 32] {
+    if cfg!(test) && CHEAT_REVEAL.get() {
+        ni[0] ^= 1;
+    }
+    ni
+}
+
+fn read_record(secure: &mut SecureStream, deadline: Instant) -> Result<Vec<u8>, Error> {
+    match secure.reader.read_record_by(deadline)? {
         Some(record) => Ok(record.to_vec()),
         None => Err(Error::Io(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "peer closed the connection during the handshake",
         ))),
     }
-}
-
-/// Six decimal digits from the handshake hash, which both sides only share
-/// if nobody substituted keys in the middle.
-pub fn pairing_code(handshake_hash: &[u8]) -> String {
-    let n = u64::from_be_bytes(handshake_hash[..8].try_into().expect("32-byte hash")) % 1_000_000;
-    format!("{:03} {:03}", n / 1000, n % 1000)
 }
 
 fn send_handshake(
@@ -355,11 +505,15 @@ fn send_handshake(
     Ok(())
 }
 
-fn recv_handshake(stream: &mut TcpStream, hs: &mut HandshakeState) -> Result<Vec<u8>, Error> {
+fn recv_handshake(
+    stream: &TcpStream,
+    hs: &mut HandshakeState,
+    deadline: Instant,
+) -> Result<Vec<u8>, Error> {
     let mut len = [0; 2];
-    stream.read_exact(&mut len)?;
+    read_exact_by(stream, &mut len, deadline)?;
     let mut msg = vec![0; u16::from_be_bytes(len) as usize];
-    stream.read_exact(&mut msg)?;
+    read_exact_by(stream, &mut msg, deadline)?;
     let mut payload = vec![0; msg.len()];
     let n = hs.read_message(&msg, &mut payload)?;
     payload.truncate(n);
@@ -374,4 +528,83 @@ fn floor_char_boundary(s: &str, mut i: usize) -> usize {
         i -= 1;
     }
     i
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn code_depends_on_the_hash_and_both_nonces() {
+        let (h, ni, nr) = ([1; 32], [2; 32], [3; 32]);
+        let code = pairing_code(&h, &ni, &nr);
+        assert_eq!(code.len(), 7);
+        assert_eq!(code, pairing_code(&h, &ni, &nr));
+        assert_ne!(code, pairing_code(&[9; 32], &ni, &nr));
+        assert_ne!(code, pairing_code(&h, &[9; 32], &nr));
+        assert_ne!(code, pairing_code(&h, &ni, &[9; 32]));
+        // Swapping the nonces' roles changes it too.
+        assert_ne!(code, pairing_code(&h, &nr, &ni));
+    }
+
+    #[test]
+    fn a_reveal_that_does_not_match_the_commitment_aborts() {
+        let identities = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        let (pc_trust, mac_trust) = (
+            Mutex::new(TrustStore::in_memory()),
+            Mutex::new(TrustStore::in_memory()),
+        );
+        let (pc_slot, mac_slot) = (PairingSlot::new(), PairingSlot::new());
+        // Only the Mac verifies the reveal, so only its user must never be
+        // asked. (The PC's user may see a code; nothing gets pinned anyway.)
+        let mac_asked = AtomicBool::new(false);
+        let mac_confirm = |_: &PairingRequest| {
+            mac_asked.store(true, Ordering::SeqCst);
+            true
+        };
+        let pc_confirm = |_: &PairingRequest| true;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, server) = thread::scope(|s| {
+            let server = s.spawn(|| {
+                let opts = Options {
+                    can_pair: true,
+                    confirm: &mac_confirm,
+                    pairing_slot: &mac_slot,
+                    ..Options::new(&identities.1, "mac", &mac_trust)
+                };
+                accept(listener.accept().unwrap().0, &opts)
+            });
+            CHEAT_REVEAL.set(true);
+            let opts = Options {
+                can_pair: true,
+                confirm: &pc_confirm,
+                pairing_slot: &pc_slot,
+                ..Options::new(&identities.0, "pc", &pc_trust)
+            };
+            let client = connect(TcpStream::connect(addr).unwrap(), &opts);
+            CHEAT_REVEAL.set(false);
+            (client, server.join().unwrap())
+        });
+        let server = server.unwrap_err();
+        assert!(matches!(server, Error::CommitmentMismatch), "{server:?}");
+        assert!(client.is_err());
+        assert!(
+            !mac_asked.load(Ordering::SeqCst),
+            "no code shown to the mac's user"
+        );
+        assert!(mac_trust.lock().unwrap().peers().is_empty());
+        assert!(pc_trust.lock().unwrap().peers().is_empty());
+    }
+
+    #[test]
+    fn pairing_slot_is_exclusive() {
+        let slot = PairingSlot::new();
+        let guard = slot.try_take().unwrap();
+        assert!(slot.try_take().is_none());
+        drop(guard);
+        assert!(slot.try_take().is_some());
+    }
 }

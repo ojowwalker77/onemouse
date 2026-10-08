@@ -68,7 +68,9 @@ impl TrustStore {
         &self.peers
     }
 
+    /// `name` is compared after [`sanitize_name`], like it's stored.
     pub fn check(&self, name: &str, key: &PublicKey) -> Trust {
+        let name = sanitize_name(name);
         if self.peers.iter().any(|p| &p.key == key) {
             Trust::Pinned
         } else if self.peers.iter().any(|p| p.name == name) {
@@ -82,7 +84,7 @@ impl TrustStore {
     /// saves. Refuses to replace a different key already pinned under that
     /// name: [`TrustStore::forget`] it first.
     pub fn pin(&mut self, name: &str, key: &PublicKey) -> io::Result<()> {
-        let name = sanitize(name);
+        let name = sanitize_name(name);
         let paired_at = self
             .peers
             .iter()
@@ -142,11 +144,22 @@ fn parse_line(line: &str) -> Option<PinnedPeer> {
     fields.next().is_none().then_some(peer)
 }
 
-/// Names are free text from the peer; keep the file format intact.
-fn sanitize(name: &str) -> String {
+/// Device names come from the peer and end up in the store file and in
+/// pairing dialogs: control characters become spaces (they'd break the file
+/// format), bidi overrides and isolates are dropped (they can make a name
+/// display as something else), and surrounding whitespace is trimmed.
+pub fn sanitize_name(name: &str) -> String {
+    const BIDI: [std::ops::RangeInclusive<char>; 3] = [
+        '\u{200E}'..='\u{200F}',
+        '\u{202A}'..='\u{202E}',
+        '\u{2066}'..='\u{2069}',
+    ];
     name.chars()
+        .filter(|c| !BIDI.iter().any(|r| r.contains(c)))
         .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
+        .collect::<String>()
+        .trim()
+        .to_owned()
 }
 
 #[cfg(test)]
@@ -170,6 +183,20 @@ mod tests {
         assert!(store.forget("mac").unwrap());
         assert!(!store.forget("mac").unwrap());
         assert_eq!(store.check("mac", &K2), Trust::Unknown);
+    }
+
+    #[test]
+    fn names_are_sanitized_the_same_way_everywhere() {
+        assert_eq!(
+            sanitize_name(" jow's\tMac\u{202E}gpj.exe\u{2066} "),
+            "jow's Macgpj.exe"
+        );
+        let mut store = TrustStore::in_memory();
+        store.pin("jow's\u{1}Mac", &K1).unwrap();
+        assert_eq!(store.peers()[0].name, "jow's Mac");
+        // A control character can't dodge the known-name check.
+        assert_eq!(store.check("jow's\u{1}Mac", &K2), Trust::KeyChanged);
+        assert_eq!(store.check("jow's\u{202E}\u{1}Mac", &K2), Trust::KeyChanged);
     }
 
     #[test]
