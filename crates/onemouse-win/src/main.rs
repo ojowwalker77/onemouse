@@ -328,7 +328,7 @@ mod platform {
 
     use onemouse_transport::PairingRequest;
     use onemouse_win::autostart::{self, SingleInstance};
-    use onemouse_win::client::{self, Config, SharedInjector};
+    use onemouse_win::client::{self, Config, Host, SharedInjector};
     use onemouse_win::inject::Injector;
     use onemouse_win::sendinput::SendInputBackend;
     use onemouse_win::{WindowsHost, display, log, tray};

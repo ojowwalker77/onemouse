@@ -454,17 +454,14 @@ pub mod imp {
     use super::*;
     use std::ptr;
 
-    use windows_sys::Win32::Foundation::{HHOOK, LPARAM, LRESULT, RECT, WPARAM};
+    use windows_sys::Win32::Foundation::{LPARAM, LRESULT, RECT, WPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        CallNextHookEx, HC_ACTION, KBDLLHOOKSTRUCT, MSLLHOOKSTRUCT, SetWindowsHookExW,
-        UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
-    };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        ClipCursor, DispatchMessageW, GetCursorPos, GetMessageW, LLKHF_EXTENDED, LLKHF_INJECTED,
-        LLKHF_UP, LLMHF_INJECTED, MSG, PostThreadMessageW, SetCursorPos, ShowCursor,
-        TranslateMessage, WM_QUIT,
+        CallNextHookEx, ClipCursor, DispatchMessageW, GetMessageW, HC_ACTION, HHOOK,
+        KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_UP, LLMHF_INJECTED, MSG,
+        MSLLHOOKSTRUCT, PostThreadMessageW, SetCursorPos, SetWindowsHookExW, ShowCursor,
+        TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_QUIT,
     };
 
     use crate::log;
@@ -479,8 +476,11 @@ pub mod imp {
     struct ThreadState {
         mainside: MainSide<WinCursor>,
         cmd: Receiver<Command>,
-        kbd: HHOOK,
-        mouse: HHOOK,
+        // Raw hook handles: `HHOOK` is a raw pointer and not `Send`, so the
+        // values are kept as `isize` and only cast back for Win32 calls made
+        // on this same thread.
+        kbd: isize,
+        mouse: isize,
     }
 
     pub struct WinCursor;
@@ -579,19 +579,19 @@ pub mod imp {
                 Some(kbd_proc),
                 GetModuleHandleW(ptr::null()),
                 0,
-            );
+            ) as isize;
             let mouse = SetWindowsHookExW(
                 WH_MOUSE_LL,
                 Some(mouse_proc),
                 GetModuleHandleW(ptr::null()),
                 0,
-            );
-            if kbd.is_null() || mouse.is_null() {
-                if !kbd.is_null() {
-                    UnhookWindowsHookEx(kbd);
+            ) as isize;
+            if kbd == 0 || mouse == 0 {
+                if kbd != 0 {
+                    UnhookWindowsHookEx(kbd as HHOOK);
                 }
-                if !mouse.is_null() {
-                    UnhookWindowsHookEx(mouse);
+                if mouse != 0 {
+                    UnhookWindowsHookEx(mouse as HHOOK);
                 }
                 log!("capture hooks failed: {}", std::io::Error::last_os_error());
                 return;
@@ -608,8 +608,8 @@ pub mod imp {
                 DispatchMessageW(&msg);
             }
             if let Some(state) = STATE.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                UnhookWindowsHookEx(state.kbd);
-                UnhookWindowsHookEx(state.mouse);
+                UnhookWindowsHookEx(state.kbd as HHOOK);
+                UnhookWindowsHookEx(state.mouse as HHOOK);
             }
             // Never strand a hidden/clipped cursor if anything above failed.
             // (`Leave` itself goes out from `Handle::stop`, after this join.)
@@ -652,7 +652,7 @@ pub mod imp {
 
     unsafe extern "system" fn kbd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         let mut hook: HHOOK = ptr::null_mut();
-        let swallowed = (ncode == HC_ACTION)
+        let swallowed = (ncode == HC_ACTION as i32)
             .then(|| {
                 // SAFETY: `lparam` is a `KBDLLHOOKSTRUCT` for `HC_ACTION`.
                 let info = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
@@ -660,7 +660,7 @@ pub mod imp {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .as_ref()
-                    .map(|s| s.kbd)
+                    .map(|s| s.kbd as HHOOK)
                     .unwrap_or(ptr::null_mut());
                 if info.flags & LLKHF_INJECTED != 0 {
                     return None;
@@ -686,7 +686,7 @@ pub mod imp {
 
     unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         let mut hook: HHOOK = ptr::null_mut();
-        let event = (ncode == HC_ACTION)
+        let event = (ncode == HC_ACTION as i32)
             .then(|| {
                 // SAFETY: `lparam` is an `MSLLHOOKSTRUCT` for `HC_ACTION`.
                 let info = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
@@ -694,7 +694,7 @@ pub mod imp {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .as_ref()
-                    .map(|s| s.mouse)
+                    .map(|s| s.mouse as HHOOK)
                     .unwrap_or(ptr::null_mut());
                 if info.flags & LLMHF_INJECTED != 0 {
                     return None;
