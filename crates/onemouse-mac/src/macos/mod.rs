@@ -6,10 +6,12 @@
 #![allow(non_upper_case_globals)]
 
 mod ffi;
+mod ui;
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::panic::{self, AssertUnwindSafe};
+use std::path::PathBuf;
 use std::ptr;
 use std::sync::Arc;
 
@@ -17,6 +19,7 @@ use onemouse_protocol::MouseButton;
 use onemouse_protocol::key;
 
 use self::ffi::*;
+use crate::config::Config;
 use crate::controller::{self, Controller, Input, Output};
 use crate::keymap;
 use crate::layout::{Point, Rect};
@@ -73,20 +76,36 @@ pub fn keyboard_is_iso() -> bool {
     unsafe { KBGetLayoutType(LMGetKbdType().into()) == kKeyboardISO }
 }
 
+/// Everything the event tap and the UI share. Only touched on the main
+/// thread.
 struct Tap {
     controller: RefCell<Controller>,
     link: Arc<Link>,
+    config: RefCell<Config>,
+    config_path: Option<PathBuf>,
+    /// Open the Arrange Displays window at launch.
+    arrange_at_start: bool,
     iso: bool,
     scroll_speed: f64,
     port: Cell<CFMachPortRef>,
     cursor_hidden: Cell<bool>,
 }
 
-/// Installs the event tap and runs the main run loop forever.
-pub fn run(controller: Controller, link: Arc<Link>, scroll_speed: f64) -> Result<(), String> {
+/// Installs the event tap and runs the menu-bar app until Quit.
+pub fn run(
+    controller: Controller,
+    link: Arc<Link>,
+    config: Config,
+    config_path: Option<PathBuf>,
+    scroll_speed: f64,
+    arrange_at_start: bool,
+) -> Result<(), String> {
     let tap: &'static Tap = Box::leak(Box::new(Tap {
         controller: RefCell::new(controller),
         link,
+        config: RefCell::new(config),
+        config_path,
+        arrange_at_start,
         iso: keyboard_is_iso(),
         scroll_speed,
         port: Cell::new(ptr::null_mut()),
@@ -142,8 +161,8 @@ pub fn run(controller: Controller, link: Arc<Link>, scroll_speed: f64) -> Result
         let source = CFMachPortCreateRunLoopSource(ptr::null(), port, 0);
         CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes);
         CGEventTapEnable(port, true);
-        CFRunLoopRun();
     }
+    ui::run(tap);
     Ok(())
 }
 

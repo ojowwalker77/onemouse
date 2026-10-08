@@ -6,6 +6,7 @@
 //!
 //! Until M2 (Noise encryption) this is plaintext: dev use on a trusted LAN only.
 
+pub mod config;
 pub mod controller;
 pub mod keymap;
 pub mod layout;

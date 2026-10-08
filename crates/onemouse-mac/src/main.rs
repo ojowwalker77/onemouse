@@ -6,18 +6,21 @@ const USAGE: &str = "\
 onemouse-mac: share this Mac's keyboard and trackpad with a Windows PC
 
 USAGE:
-    onemouse-mac [--side <side>] [--port <port>] [--name <name>] [--scroll-speed <x>]
+    onemouse-mac [--side <side>] [--arrange] [--port <port>] [--name <name>] [--scroll-speed <x>]
     onemouse-mac --list-displays
 
 OPTIONS:
-    --side <side>        Where the PC's screen is: left, right, top or bottom (default right)
+    --side <side>        Where the PC starts until you arrange it: left, right, top or
+                         bottom (default right)
+    --arrange            Open the Arrange Displays window at launch
     --port <port>        TCP port to listen on (default 24801)
     --name <name>        Name shown on the PC (default: this Mac's name)
     --scroll-speed <x>   Scroll speed multiplier on the PC (default 1.0)
     --list-displays      Print this Mac's displays, then exit
     -h, --help           Show this help
 
-Push the cursor past the chosen edge to control the PC; push it back to return.
+Arrange the PC from the ⇄ menu-bar item, then push the cursor where the two
+screens touch to control the PC; push it back to return.
 Ctrl+Option+Cmd+Esc always brings the cursor back to the Mac.
 
 v1 is plaintext: use it only on a trusted LAN until encryption (M2) lands.";
@@ -29,6 +32,7 @@ enum Command {
         port: u16,
         name: Option<String>,
         scroll_speed: f64,
+        arrange: bool,
     },
     ListDisplays,
     Help,
@@ -38,7 +42,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
     let mut args = args.into_iter();
     let (mut side, mut port, mut name) = (Side::Right, onemouse_protocol::DEFAULT_PORT, None);
     let mut scroll_speed = 1.0;
-    let mut list = false;
+    let (mut list, mut arrange) = (false, false);
     while let Some(arg) = args.next() {
         let mut value = |flag: &str| args.next().ok_or(format!("{flag} needs a value"));
         match arg.as_str() {
@@ -59,6 +63,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
                     .filter(|s: &f64| *s > 0.0)
                     .ok_or(format!("invalid scroll speed: {v}"))?;
             }
+            "--arrange" => arrange = true,
             "--list-displays" => list = true,
             "-h" | "--help" => return Ok(Command::Help),
             other => return Err(format!("unexpected argument: {other}")),
@@ -72,6 +77,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
         port,
         name,
         scroll_speed,
+        arrange,
     })
 }
 
@@ -97,6 +103,7 @@ mod platform {
     use std::net::{TcpListener, UdpSocket};
     use std::process::ExitCode;
 
+    use onemouse_mac::config::Config;
     use onemouse_mac::controller::Controller;
     use onemouse_mac::server::{self, Link};
     use onemouse_mac::{log, macos};
@@ -109,6 +116,7 @@ mod platform {
             port,
             name,
             scroll_speed,
+            arrange,
         } = command
         else {
             for d in macos::displays() {
@@ -142,7 +150,11 @@ mod platform {
             lan_ip().unwrap_or_else(|| "0.0.0.0".into())
         );
         log!("Ctrl+Option+Cmd+Esc brings the cursor back");
-        match macos::run(Controller::new(side, None), link, scroll_speed) {
+        let config_path = Config::default_path();
+        let config = config_path.as_deref().map(Config::load).unwrap_or_default();
+        log!("arrange the PC from the ⇄ menu-bar item");
+        let controller = Controller::new(side, config.origin);
+        match macos::run(controller, link, config, config_path, scroll_speed, arrange) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 log!("{e}");
@@ -197,17 +209,19 @@ mod tests {
                 port: onemouse_protocol::DEFAULT_PORT,
                 name: None,
                 scroll_speed: 1.0,
+                arrange: false,
             })
         );
         assert_eq!(
             parse(args(
-                "--side below --port 9000 --name air --scroll-speed 2.5"
+                "--side below --port 9000 --name air --scroll-speed 2.5 --arrange"
             )),
             Ok(Command::Run {
                 side: Side::Bottom,
                 port: 9000,
                 name: Some("air".into()),
                 scroll_speed: 2.5,
+                arrange: true,
             })
         );
     }
