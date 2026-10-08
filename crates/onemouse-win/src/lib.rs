@@ -11,17 +11,22 @@
 pub mod client;
 pub mod inject;
 pub mod keymap;
+pub mod logging;
 
+#[cfg(windows)]
+pub mod autostart;
 #[cfg(windows)]
 pub mod display;
 #[cfg(windows)]
 pub mod sendinput;
+#[cfg(windows)]
+pub mod tray;
 
 #[macro_export]
 #[doc(hidden)]
 macro_rules! log {
     ($($arg:tt)*) => {
-        eprintln!("[onemouse-win] {}", format_args!($($arg)*))
+        $crate::logging::write(format_args!($($arg)*))
     };
 }
 
@@ -44,5 +49,9 @@ impl client::Host for WindowsHost {
 
     fn display_generation(&self) -> u64 {
         display::generation()
+    }
+
+    fn status(&self, status: &str) {
+        tray::set_status(status);
     }
 }
