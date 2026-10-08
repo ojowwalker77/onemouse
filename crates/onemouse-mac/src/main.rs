@@ -142,7 +142,7 @@ mod platform {
             lan_ip().unwrap_or_else(|| "0.0.0.0".into())
         );
         log!("Ctrl+Option+Cmd+Esc brings the cursor back");
-        match macos::run(Controller::new(side), link, scroll_speed) {
+        match macos::run(Controller::new(side, None), link, scroll_speed) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 log!("{e}");
