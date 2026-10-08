@@ -123,7 +123,12 @@ impl Read for DeadlineReader<'_> {
             .checked_duration_since(Instant::now())
             .filter(|left| !left.is_zero())
             .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "deadline passed"))?;
-        self.tcp.set_read_timeout(Some(left))?;
+        match self.tcp.set_read_timeout(Some(left)) {
+            // macOS refuses setsockopt once the peer has closed; the read
+            // below still returns what's buffered, then EOF.
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput => {}
+            other => other?,
+        }
         let mut tcp = self.tcp;
         tcp.read(buf)
     }
