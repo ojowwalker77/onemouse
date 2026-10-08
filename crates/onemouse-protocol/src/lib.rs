@@ -1,8 +1,9 @@
 //! Wire protocol shared by the onemouse **primary** (macOS, owns the keyboard
 //! and trackpad) and **secondary** (Windows, receives and injects input).
 //!
-//! The secondary connects to the primary over TCP and both sides exchange
-//! length-prefixed [`Message`] frames (see [`frame`]). See `docs/PROTOCOL.md`
+//! The secondary connects to the primary over TCP, both sides establish the
+//! encrypted `onemouse-transport` channel, then exchange length-prefixed
+//! [`Message`] frames (see [`frame`]) inside it. See `docs/PROTOCOL.md`
 //! for the conversation flow.
 //!
 //! # Compatibility rules
@@ -24,7 +25,12 @@ pub use frame::{FrameError, MAX_FRAME_LEN, decode, encode, read_message, write_m
 pub use key::KeyCode;
 
 /// Wire protocol version. Both sides must match exactly.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// - 1: plaintext TCP (M1, dev only).
+/// - 2: the same messages inside the `onemouse-transport` channel (Noise XX,
+///   pinned keys, pairing). A v1 peer can't complete the handshake, so a
+///   mismatch shows up as a failed handshake rather than a `Reject`.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// TCP port the primary listens on.
 pub const DEFAULT_PORT: u16 = 24801;

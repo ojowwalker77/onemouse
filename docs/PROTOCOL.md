@@ -1,4 +1,4 @@
-# onemouse protocol (v1)
+# onemouse protocol (v2)
 
 Source of truth: [`crates/onemouse-protocol`](../crates/onemouse-protocol/src/lib.rs). This page describes the flow.
 
@@ -6,6 +6,17 @@ Source of truth: [`crates/onemouse-protocol`](../crates/onemouse-protocol/src/li
 
 - **Primary** (macOS): owns the keyboard and trackpad. Listens on TCP `24801`.
 - **Secondary** (Windows): connects to the primary and injects the input it receives.
+
+## Transport
+
+The TCP connection is encrypted and mutually authenticated by [`crates/onemouse-transport`](../crates/onemouse-transport/src/lib.rs) (wire format in its crate docs):
+
+1. Noise `XX_25519_ChaChaPoly_BLAKE2s` handshake; the secondary initiates; device names travel in the handshake.
+2. Trust exchange: pinned keys continue silently; a name pinned to a different key closes the connection (never re-paired automatically); otherwise **pairing**.
+3. Pairing: both screens show a 6-digit code derived from the handshake hash **and two random nonces exchanged commit-then-reveal** (the initiator commits to its nonce before seeing the responder's, so nobody, not even a man in the middle running two handshakes, can steer the code). Both users confirm it matches, then each side pins the other's key. The primary only pairs while its user has pairing mode open, one pairing at a time. 60 s limit.
+4. Everything below (framing, messages) runs unchanged inside encrypted records.
+
+Discovery: the primary advertises `_onemouse._tcp` over mDNS with TXT `fp=<key fingerprint>`, `name=`, `v=<PROTOCOL_VERSION>`.
 
 ## Framing
 
@@ -42,4 +53,10 @@ Variants and fields are **append-only**, and `Hello` stays variant 0. Any change
 
 ## Security
 
-v1 is **plaintext**: dev use on a trusted LAN only. M2 wraps the TCP stream in Noise `XX` with pinned keys and one-time pairing, and keeps the framing above unchanged inside the encrypted channel.
+Since v2 every byte after the handshake is encrypted and authenticated (ChaCha20-Poly1305, implicit nonces: tampered, replayed or reordered records fail). Each device's static X25519 key lives in its per-user config directory with user-only permissions, and peers are pinned by key after a pairing both users confirmed. What's still trusted:
+
+- The pairing moment: users must actually compare the codes. A wrong "yes" pins an attacker.
+- The local machines: anything running as the user can read the key files and inject input anyway.
+- Availability: anyone on the network can still connect and fail, or interfere with traffic.
+
+v1 (plaintext, M1) is gone: a v1 peer fails the handshake.
