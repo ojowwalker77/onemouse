@@ -59,7 +59,7 @@ fn main() {
         ("move back across", mv(-500.0, 0.0)),
         ("", key(key::LEFT_SHIFT, false)),
     ];
-    let mut controller = Controller::new(Side::Right);
+    let mut controller = Controller::new(Side::Right, None);
     for (label, input) in script {
         let out = link.with_peer(|peer| {
             let view = peer.map(|p| Peer {
