@@ -10,3 +10,4 @@ repository = "https://github.com/ojowwalker77/onemouse"
 
 [workspace.dependencies]
 onemouse-protocol = { path = "crates/onemouse-protocol" }
+onemouse-transport = { path = "crates/onemouse-transport" }

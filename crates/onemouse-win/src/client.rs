@@ -1,10 +1,11 @@
-//! Connection to the primary: handshake, apply incoming messages, heartbeat,
-//! display updates, reconnect. Portable (tested on every CI runner); the
-//! Windows specifics come in through [`Host`] and the injector [`Backend`].
+//! Connection to the primary: discovery, encrypted handshake and pairing,
+//! `Hello`, apply incoming messages, heartbeat, display updates, reconnect.
+//! Portable (tested on every CI runner); the Windows specifics come in
+//! through [`Host`] and the injector [`Backend`].
 
 use std::fmt;
-use std::io;
-use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -13,6 +14,8 @@ use std::time::{Duration, Instant};
 use onemouse_protocol::{
     Display, FrameError, Hello, Message, Os, PROTOCOL_VERSION, read_message, write_message,
 };
+
+use onemouse_transport::{Identity, PairingRequest, TrustStore, discovery, fingerprint};
 
 use crate::inject::{Backend, Injector};
 use crate::log;
@@ -52,10 +55,30 @@ pub fn lock<B>(injector: &SharedInjector<B>) -> MutexGuard<'_, Injector<B>> {
     injector.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Who we are and whom we trust.
+pub struct Security {
+    pub identity: Identity,
+    pub trust: Mutex<TrustStore>,
+    /// Asks the user whether the pairing code matches the Mac's.
+    pub confirm: Box<dyn Fn(&PairingRequest) -> bool + Send + Sync>,
+}
+
+impl fmt::Debug for Security {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Security")
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub host: String,
+    /// The primary's address; `None` finds it over mDNS.
+    pub host: Option<String>,
     pub port: u16,
+    pub security: Arc<Security>,
+    /// How long to browse for the primary.
+    pub discovery_timeout: Duration,
     pub connect_timeout: Duration,
     pub ping_interval: Duration,
     /// Drop the connection when nothing arrives for this long.
@@ -65,10 +88,12 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn new(host: impl Into<String>, port: u16) -> Self {
+    pub fn new(host: Option<String>, port: u16, security: Arc<Security>) -> Self {
         Self {
-            host: host.into(),
+            host,
             port,
+            security,
+            discovery_timeout: Duration::from_secs(3),
             connect_timeout: Duration::from_secs(5),
             ping_interval: Duration::from_secs(2),
             silence_timeout: Duration::from_secs(6),
@@ -83,6 +108,8 @@ pub enum ClientError {
     Frame(FrameError),
     Rejected(String),
     Protocol(String),
+    Transport(onemouse_transport::Error),
+    Discovery(String),
 }
 
 impl fmt::Display for ClientError {
@@ -103,6 +130,8 @@ impl fmt::Display for ClientError {
             Self::Frame(e) => write!(f, "{e}"),
             Self::Rejected(reason) => write!(f, "rejected by primary: {reason}"),
             Self::Protocol(what) => write!(f, "protocol error: {what}"),
+            Self::Transport(e) => write!(f, "{e}"),
+            Self::Discovery(what) => write!(f, "{what}"),
         }
     }
 }
@@ -112,6 +141,12 @@ impl std::error::Error for ClientError {}
 impl From<io::Error> for ClientError {
     fn from(e: io::Error) -> Self {
         Self::Io(e)
+    }
+}
+
+impl From<onemouse_transport::Error> for ClientError {
+    fn from(e: onemouse_transport::Error) -> Self {
+        Self::Transport(e)
     }
 }
 
@@ -162,7 +197,7 @@ pub fn run<H: Host, B: Backend + Send + 'static>(
         let mut welcomed = false;
         match run_session(config, &host, &injector, || welcomed = true) {
             Ok(()) => log!("disconnected"),
-            Err(e) => log!("connection to {}:{} ended: {e}", config.host, config.port),
+            Err(e) => log!("connection ended: {e}"),
         }
         lock(&injector).release_all();
         if welcomed && started.elapsed() > Duration::from_secs(10) {
@@ -183,50 +218,158 @@ pub fn run_session<H: Host, B: Backend + Send + 'static>(
     injector: &SharedInjector<B>,
     on_welcome: impl FnOnce(),
 ) -> Result<(), ClientError> {
-    let mut stream = connect(config)?;
-    let result = session(config, host, injector, &mut stream, on_welcome);
-    lock(injector).release_all();
-    let _ = stream.shutdown(Shutdown::Both);
-    result
-}
-
-fn connect(config: &Config) -> Result<TcpStream, ClientError> {
-    let addrs: Vec<SocketAddr> = (config.host.as_str(), config.port)
-        .to_socket_addrs()?
-        .collect();
-    let mut last_err = io::Error::new(io::ErrorKind::NotFound, "host resolved to no address");
-    for addr in addrs {
-        match TcpStream::connect_timeout(&addr, config.connect_timeout) {
-            Ok(stream) => return Ok(stream),
-            Err(e) => last_err = e,
+    let mut on_welcome = Some(on_welcome);
+    let mut last_err = None;
+    // Several candidates when discovery sees more than one answer for our
+    // Mac (e.g. someone else advertising its fingerprint): the handshake
+    // tells the real one apart, so failures before Welcome move on.
+    for addr in candidates(config)? {
+        let tcp = match TcpStream::connect_timeout(&addr, config.connect_timeout) {
+            Ok(tcp) => tcp,
+            Err(e) => {
+                last_err = Some(e.into());
+                continue;
+            }
+        };
+        let mut welcomed = false;
+        let result = session(config, host, injector, &tcp, || {
+            welcomed = true;
+            if let Some(f) = on_welcome.take() {
+                f();
+            }
+        });
+        lock(injector).release_all();
+        let _ = tcp.shutdown(Shutdown::Both);
+        match result {
+            Err(e) if !welcomed => {
+                log!("{addr}: {e}");
+                last_err = Some(e);
+            }
+            other => return other,
         }
     }
-    Err(last_err.into())
+    Err(last_err.unwrap_or_else(|| {
+        ClientError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            "host resolved to no address",
+        ))
+    }))
+}
+
+fn candidates(config: &Config) -> Result<Vec<SocketAddr>, ClientError> {
+    match &config.host {
+        Some(host) => Ok((host.as_str(), config.port).to_socket_addrs()?.collect()),
+        None => discover(config),
+    }
+}
+
+/// Finds the primary over mDNS.
+fn discover(config: &Config) -> Result<Vec<SocketAddr>, ClientError> {
+    let pinned: Vec<String> = config
+        .security
+        .trust
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .peers()
+        .iter()
+        .map(|p| fingerprint(&p.key))
+        .collect();
+    let found = discovery::browse(config.discovery_timeout, pinned.first().map(String::as_str))
+        .map_err(|e| ClientError::Discovery(format!("mDNS browse failed: {e}")))?;
+    let chosen = choose(&found, &pinned).map_err(ClientError::Discovery)?;
+    for f in &chosen {
+        log!("found {} at {}", f.name, display_addrs(&f.addrs));
+    }
+    Ok(chosen
+        .iter()
+        .flat_map(|f| f.addrs.iter().map(|ip| SocketAddr::new(*ip, f.port)))
+        .collect())
+}
+
+/// Which advertisements to try, in order: every one claiming a paired Mac's
+/// fingerprint; else, if all compatible ones claim the same fingerprint (the
+/// usual first-pairing case), all of them; else none (ambiguous).
+fn choose<'a>(
+    found: &'a [discovery::Found],
+    pinned: &[String],
+) -> Result<Vec<&'a discovery::Found>, String> {
+    let compatible: Vec<_> = found
+        .iter()
+        .filter(|f| f.version == Some(PROTOCOL_VERSION) && !f.addrs.is_empty())
+        .collect();
+    let paired: Vec<_> = compatible
+        .iter()
+        .copied()
+        .filter(|f| pinned.contains(&f.fingerprint))
+        .collect();
+    if !paired.is_empty() {
+        return Ok(paired);
+    }
+    let mut fingerprints: Vec<_> = compatible.iter().map(|f| &f.fingerprint).collect();
+    fingerprints.dedup();
+    if fingerprints.len() == 1 {
+        return Ok(compatible);
+    }
+    let seen: Vec<_> = found
+        .iter()
+        .map(|f| format!("{} (v{})", f.name, f.version.unwrap_or(0)))
+        .collect();
+    Err(if seen.is_empty() {
+        "no Mac found on the network; is onemouse running there? (or pass --host)".into()
+    } else {
+        format!(
+            "can't tell which Mac to use: found {}; pass --host",
+            seen.join(", ")
+        )
+    })
+}
+
+fn display_addrs(addrs: &[IpAddr]) -> String {
+    addrs
+        .iter()
+        .map(IpAddr::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn session<H: Host, B: Backend + Send + 'static>(
     config: &Config,
     host: &Arc<H>,
     injector: &SharedInjector<B>,
-    stream: &mut TcpStream,
+    tcp: &TcpStream,
     on_welcome: impl FnOnce(),
 ) -> Result<(), ClientError> {
-    stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(config.silence_timeout))?;
+    tcp.set_nodelay(true)?;
+
+    let name = host.name();
+    let security = &config.security;
+    let opts = onemouse_transport::Options {
+        can_pair: true,
+        confirm: &*security.confirm,
+        ..onemouse_transport::Options::new(&security.identity, &name, &security.trust)
+    };
+    let (secure, peer) = onemouse_transport::connect(tcp.try_clone()?, &opts)?;
+    if peer.newly_paired {
+        log!("paired with {} (key {})", peer.name, peer.fingerprint());
+    }
+    // On the reader's own handle: Windows doesn't share socket options
+    // between cloned handles.
+    secure.set_read_timeout(Some(config.silence_timeout))?;
+    let (mut reader, mut writer) = secure.split();
 
     let generation = host.display_generation();
     let displays = host.displays();
     write_message(
-        stream,
+        &mut writer,
         &Message::Hello(Hello {
             protocol_version: PROTOCOL_VERSION,
-            name: host.name(),
+            name,
             os: Os::Windows,
             displays: displays.clone(),
         }),
     )?;
 
-    match read_message(stream)? {
+    match read_message(&mut reader)? {
         Message::Welcome {
             protocol_version,
             name,
@@ -252,26 +395,26 @@ fn session<H: Host, B: Backend + Send + 'static>(
 
     let (tx, rx) = mpsc::channel();
     let writer = {
-        let stream = stream.try_clone()?;
+        let tcp = tcp.try_clone()?;
         let host = Arc::clone(host);
         let config = config.clone();
         thread::Builder::new()
             .name("onemouse-writer".into())
-            .spawn(move || writer(stream, rx, &*host, &config, generation, displays))?
+            .spawn(move || write_loop(writer, &tcp, rx, &*host, &config, generation, displays))?
     };
 
-    let result = read_loop(stream, injector, &tx);
+    let result = read_loop(&mut reader, injector, &tx);
 
     // Stop the writer: closing the channel ends its loop, shutting the socket
     // down unblocks a stuck write.
     drop(tx);
-    let _ = stream.shutdown(Shutdown::Both);
+    let _ = tcp.shutdown(Shutdown::Both);
     let _ = writer.join();
     result
 }
 
 fn read_loop<B: Backend>(
-    stream: &mut TcpStream,
+    stream: &mut impl Read,
     injector: &SharedInjector<B>,
     tx: &Sender<Message>,
 ) -> Result<(), ClientError> {
@@ -292,8 +435,9 @@ fn read_loop<B: Backend>(
 
 /// Sends replies, pings and display updates. The only thread writing to the
 /// socket after the handshake.
-fn writer<H: Host + ?Sized>(
-    mut stream: TcpStream,
+fn write_loop<H: Host + ?Sized>(
+    mut stream: impl Write,
+    tcp: &TcpStream,
     rx: mpsc::Receiver<Message>,
     host: &H,
     config: &Config,
@@ -335,7 +479,7 @@ fn writer<H: Host + ?Sized>(
     if let Err(e) = result {
         log!("write failed: {e}");
         // Wake the reader so the session ends now, not at the silence timeout.
-        let _ = stream.shutdown(Shutdown::Both);
+        let _ = tcp.shutdown(Shutdown::Both);
     }
 }
 
@@ -408,6 +552,7 @@ mod tests {
     use crate::inject::{Recorded, RecordingBackend};
     use crate::keymap;
     use onemouse_protocol::{KeyCode, MouseButton, key};
+    use onemouse_transport::SecureStream;
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -442,22 +587,64 @@ mod tests {
         }
     }
 
+    /// The fake primary's side of the encrypted transport.
+    struct Mac {
+        identity: Identity,
+        trust: Mutex<TrustStore>,
+        can_pair: bool,
+        /// Its own, so it doesn't compete with the PC side for the
+        /// process-wide slot.
+        slot: onemouse_transport::PairingSlot,
+    }
+
     struct Harness {
         listener: TcpListener,
         config: Config,
+        mac: Mac,
         host: Arc<TestHost>,
         injector: SharedInjector<RecordingBackend>,
     }
 
     impl Harness {
+        /// PC and Mac already paired.
         fn new() -> Self {
+            let h = Self::unpaired(|_| false);
+            h.mac
+                .trust
+                .lock()
+                .unwrap()
+                .pin("test-pc", h.config.security.identity.public_key())
+                .unwrap();
+            h.config
+                .security
+                .trust
+                .lock()
+                .unwrap()
+                .pin("macbook", h.mac.identity.public_key())
+                .unwrap();
+            h
+        }
+
+        fn unpaired(confirm: impl Fn(&PairingRequest) -> bool + Send + Sync + 'static) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let mut config = Config::new("127.0.0.1", listener.local_addr().unwrap().port());
+            let security = Arc::new(Security {
+                identity: Identity::generate().unwrap(),
+                trust: Mutex::new(TrustStore::in_memory()),
+                confirm: Box::new(confirm),
+            });
+            let port = listener.local_addr().unwrap().port();
+            let mut config = Config::new(Some("127.0.0.1".into()), port, security);
             config.ping_interval = Duration::from_secs(60);
             config.poll_interval = Duration::from_millis(10);
             Self {
                 listener,
                 config,
+                mac: Mac {
+                    identity: Identity::generate().unwrap(),
+                    trust: Mutex::new(TrustStore::in_memory()),
+                    can_pair: false,
+                    slot: onemouse_transport::PairingSlot::new(),
+                },
                 host: Arc::new(TestHost {
                     displays: Mutex::new(vec![display(0)]),
                     generation: AtomicU64::new(0),
@@ -466,19 +653,34 @@ mod tests {
             }
         }
 
-        /// Runs a session in the background, returns the primary's end of the
-        /// socket after the handshake.
-        fn start(&self) -> (TcpStream, thread::JoinHandle<Result<(), ClientError>>) {
+        fn spawn_client(&self) -> thread::JoinHandle<Result<(), ClientError>> {
             let (config, host, injector) = (
                 self.config.clone(),
                 Arc::clone(&self.host),
                 Arc::clone(&self.injector),
             );
-            let client = thread::spawn(move || run_session(&config, &host, &injector, || {}));
-            let (mut primary, _) = self.listener.accept().unwrap();
-            primary
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
+            thread::spawn(move || run_session(&config, &host, &injector, || {}))
+        }
+
+        /// The fake primary accepts and runs the encrypted handshake.
+        fn accept(&self) -> Result<SecureStream, onemouse_transport::Error> {
+            let (tcp, _) = self.listener.accept().unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let confirm = |_: &PairingRequest| true;
+            let opts = onemouse_transport::Options {
+                can_pair: self.mac.can_pair,
+                confirm: &confirm,
+                pairing_slot: &self.mac.slot,
+                ..onemouse_transport::Options::new(&self.mac.identity, "macbook", &self.mac.trust)
+            };
+            onemouse_transport::accept(tcp, &opts).map(|(secure, _)| secure)
+        }
+
+        /// Runs a session in the background, returns the primary's end of the
+        /// encrypted connection after `Hello`.
+        fn start(&self) -> (SecureStream, thread::JoinHandle<Result<(), ClientError>>) {
+            let client = self.spawn_client();
+            let mut primary = self.accept().unwrap();
             let Message::Hello(hello) = read_message(&mut primary).unwrap() else {
                 panic!("expected Hello");
             };
@@ -494,7 +696,7 @@ mod tests {
         }
     }
 
-    fn welcome(primary: &mut TcpStream) {
+    fn welcome(primary: &mut SecureStream) {
         write_message(
             primary,
             &Message::Welcome {
@@ -505,7 +707,7 @@ mod tests {
         .unwrap();
     }
 
-    fn send(primary: &mut TcpStream, msgs: &[Message]) {
+    fn send(primary: &mut SecureStream, msgs: &[Message]) {
         for msg in msgs {
             write_message(primary, msg).unwrap();
         }
@@ -715,6 +917,77 @@ mod tests {
         );
         drop(primary);
         client.join().unwrap().unwrap_err();
+    }
+
+    #[test]
+    fn unpaired_pc_is_refused_unless_the_mac_is_pairing() {
+        let h = Harness::unpaired(|_| true);
+        let client = h.spawn_client();
+        assert!(h.accept().is_err());
+        let err = client.join().unwrap().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ClientError::Transport(onemouse_transport::Error::NotPairing { here: false })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(err.to_string(), "the other device isn't in pairing mode");
+    }
+
+    #[test]
+    fn pairs_on_first_connection_when_both_users_confirm() {
+        let codes = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&codes);
+        let mut h = Harness::unpaired(move |req| {
+            seen.lock().unwrap().push(req.code.clone());
+            true
+        });
+        h.mac.can_pair = true;
+        let (mut primary, client) = h.start();
+        welcome(&mut primary);
+        send(&mut primary, &[Message::Ping(5)]);
+        assert_eq!(read_message(&mut primary).unwrap(), Message::Pong(5));
+        assert_eq!(codes.lock().unwrap().len(), 1);
+        let pinned = h.config.security.trust.lock().unwrap().peers().to_vec();
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0].name, "macbook");
+        assert_eq!(&pinned[0].key, h.mac.identity.public_key());
+        drop(primary);
+        client.join().unwrap().unwrap_err();
+    }
+
+    fn found(name: &str, fp: &str, version: u16, ip: &str) -> discovery::Found {
+        discovery::Found {
+            name: name.into(),
+            version: Some(version),
+            fingerprint: fp.into(),
+            addrs: vec![ip.parse().unwrap()],
+            port: 24801,
+        }
+    }
+
+    #[test]
+    fn discovery_prefers_paired_macs_and_keeps_every_claimant() {
+        let v = PROTOCOL_VERSION;
+        let real = found("mac", "aa", v, "10.0.0.2");
+        let spoof = found("mac", "aa", v, "10.0.0.66");
+        let other = found("office", "bb", v, "10.0.0.3");
+        let old = found("old mac", "cc", v - 1, "10.0.0.4");
+        let all = [spoof.clone(), other.clone(), real.clone(), old.clone()];
+
+        // Paired with "aa": both claimants, the handshake sorts them out.
+        let chosen = choose(&all, &["aa".into()]).unwrap();
+        assert_eq!(chosen, [&spoof, &real]);
+
+        // First pairing, one fingerprint around (plus an old version).
+        let first = [real.clone(), old.clone()];
+        assert_eq!(choose(&first, &[]).unwrap(), [&real]);
+
+        // First pairing, two different Macs: ask the user.
+        let err = choose(&[real.clone(), other], &[]).unwrap_err();
+        assert!(err.contains("pass --host"), "{err}");
+        assert!(choose(&[], &[]).unwrap_err().contains("no Mac found"));
     }
 
     #[test]

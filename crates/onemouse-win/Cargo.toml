@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 onemouse-protocol.workspace = true
+onemouse-transport.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [

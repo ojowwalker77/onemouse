@@ -1,8 +1,12 @@
+use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use onemouse_protocol::Display;
-use onemouse_win::client::{self, Config, StaticHost};
+use onemouse_transport::{IDENTITY_FILE, Identity, PEERS_FILE, PairingRequest, TrustStore};
+use onemouse_win::client::{self, Config, Security, StaticHost};
 use onemouse_win::inject::{Injector, LogBackend};
 use onemouse_win::log;
 
@@ -10,36 +14,50 @@ const USAGE: &str = "\
 onemouse-win: receive the Mac's keyboard and trackpad on this PC
 
 USAGE:
-    onemouse-win --host <mac-ip> [--port <port>] [--name <name>]
-    onemouse-win --dry-run --host <mac-ip> [--fake-displays <layout>]
-    onemouse-win --list-displays
+    onemouse-win [--host <mac-ip>] [--port <port>] [--name <name>]
+    onemouse-win --dry-run [--host <mac-ip>] [--fake-displays <layout>]
+    onemouse-win --peers | --forget <name> | --list-displays
 
 OPTIONS:
-    --host <mac-ip>           Address of the Mac running onemouse
-    --port <port>             TCP port (default 24801)
+    --host <mac-ip>           Address of the Mac (default: find it on the network)
+    --port <port>             TCP port with --host (default 24801)
     --name <name>             Name shown on the Mac (default: this computer's name)
+    --config-dir <dir>        Where the key and paired devices are kept
+                              (default %APPDATA%\\onemouse; --dry-run uses a
+                              separate \"dry-run\" subfolder)
     --dry-run                 Log the input instead of injecting it. Runs on any
                               OS, so the Mac side can be tested without a PC
     --fake-displays <layout>  Displays to report in --dry-run, comma-separated
                               WxH:X:Y[@scale], first is primary
                               (default 1920x1080:0:0@1)
+    --peers                   Show this device's key and the paired Macs
+    --forget <name>           Unpair a Mac (e.g. after it was reinstalled)
     --list-displays           Print the displays that would be reported, then exit
     -h, --help                Show this help
 
-v1 is plaintext: use it only on a trusted LAN until encryption (M2) lands.";
+The connection is encrypted. The first time, both screens show a 6-digit
+code: pair only if they match.";
 
 #[derive(Debug, PartialEq)]
 struct Run {
-    host: String,
+    host: Option<String>,
     port: u16,
     name: Option<String>,
     /// `Some` in `--dry-run`.
     dry_run: Option<Vec<Display>>,
+    config_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq)]
 enum Command {
     Run(Run),
+    Peers {
+        config_dir: Option<PathBuf>,
+    },
+    Forget {
+        name: String,
+        config_dir: Option<PathBuf>,
+    },
     ListDisplays,
     Help,
 }
@@ -48,6 +66,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
     let mut args = args.into_iter();
     let (mut host, mut port, mut name) = (None, onemouse_protocol::DEFAULT_PORT, None);
     let (mut list, mut dry_run, mut fake) = (false, false, None);
+    let (mut peers, mut forget, mut config_dir) = (false, None, None);
     while let Some(arg) = args.next() {
         let mut value = |flag: &str| args.next().ok_or(format!("{flag} needs a value"));
         match arg.as_str() {
@@ -57,8 +76,11 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
                 port = v.parse().map_err(|_| format!("invalid port: {v}"))?;
             }
             "--name" => name = Some(value("--name")?),
+            "--config-dir" => config_dir = Some(PathBuf::from(value("--config-dir")?)),
             "--dry-run" => dry_run = true,
             "--fake-displays" => fake = Some(parse_displays(&value("--fake-displays")?)?),
+            "--peers" => peers = true,
+            "--forget" => forget = Some(value("--forget")?),
             "--list-displays" => list = true,
             "-h" | "--help" => return Ok(Command::Help),
             other => return Err(format!("unexpected argument: {other}")),
@@ -67,16 +89,22 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
     if list {
         return Ok(Command::ListDisplays);
     }
+    if peers {
+        return Ok(Command::Peers { config_dir });
+    }
+    if let Some(name) = forget {
+        return Ok(Command::Forget { name, config_dir });
+    }
     if fake.is_some() && !dry_run {
         return Err("--fake-displays needs --dry-run".into());
     }
-    let host = host.ok_or("--host is required")?;
     let dry_run = dry_run.then(|| fake.unwrap_or_else(|| parse_displays("1920x1080:0:0").unwrap()));
     Ok(Command::Run(Run {
         host,
         port,
         name,
         dry_run,
+        config_dir,
     }))
 }
 
@@ -111,6 +139,76 @@ fn parse_displays(spec: &str) -> Result<Vec<Display>, String> {
         .collect()
 }
 
+fn config_dir(explicit: Option<PathBuf>, dry_run: bool) -> io::Result<PathBuf> {
+    match explicit {
+        Some(dir) => Ok(dir),
+        None if dry_run => Ok(onemouse_transport::config_dir()?.join("dry-run")),
+        None => onemouse_transport::config_dir(),
+    }
+}
+
+fn load_trust(dir: &Path) -> io::Result<TrustStore> {
+    TrustStore::load(&dir.join(PEERS_FILE))
+}
+
+/// Shows the pairing code in the terminal and asks the user to compare.
+fn confirm_in_terminal(req: &PairingRequest) -> bool {
+    eprintln!();
+    eprintln!(
+        "  New Mac: \"{}\" (key {})",
+        req.peer_name, req.peer_fingerprint
+    );
+    eprintln!();
+    eprintln!("      Pairing code:  {}", req.code);
+    eprintln!();
+    let secs = req
+        .deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .as_secs();
+    eprintln!("  Check that the Mac shows the same code (within {secs} s).");
+    eprint!("  Type y and press Enter if it matches (anything else cancels): ");
+    let _ = io::stderr().flush();
+    let mut answer = String::new();
+    match io::stdin().lock().read_line(&mut answer) {
+        Ok(n) if n > 0 => matches!(answer.trim(), "y" | "Y" | "yes" | "s" | "sim"),
+        _ => false,
+    }
+}
+
+fn security(dir: &Path) -> io::Result<Security> {
+    Ok(Security {
+        identity: Identity::load_or_create(&dir.join(IDENTITY_FILE))?,
+        trust: Mutex::new(load_trust(dir)?),
+        confirm: Box::new(confirm_in_terminal),
+    })
+}
+
+fn days_ago(unix: u64) -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    now.saturating_sub(unix) / 86_400
+}
+
+fn peers(dir: &Path) -> io::Result<()> {
+    let identity = Identity::load_or_create(&dir.join(IDENTITY_FILE))?;
+    println!("this PC's key: {}", identity.fingerprint());
+    println!("stored in:     {}", dir.display());
+    let trust = load_trust(dir)?;
+    if trust.peers().is_empty() {
+        println!("no paired Macs yet");
+    }
+    for peer in trust.peers() {
+        println!(
+            "paired: {}  (key {}, {} day(s) ago)",
+            peer.name,
+            onemouse_transport::fingerprint(&peer.key),
+            days_ago(peer.paired_at)
+        );
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let command = match parse(std::env::args().skip(1)) {
         Ok(command) => command,
@@ -119,27 +217,59 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match command {
+    let result = match command {
         Command::Help => {
             println!("{USAGE}");
-            ExitCode::SUCCESS
+            return ExitCode::SUCCESS;
         }
-        Command::Run(Run {
-            host,
-            port,
+        Command::ListDisplays => return platform::list_displays(),
+        Command::Peers { config_dir: dir } => config_dir(dir, false).and_then(|dir| peers(&dir)),
+        Command::Forget {
             name,
-            dry_run: Some(displays),
-        }) => {
-            let name = name.unwrap_or_else(|| "onemouse-dry-run".into());
-            log!("dry run: logging input instead of injecting it");
-            log!("connecting to {host}:{port} as {name}");
+            config_dir: dir,
+        } => config_dir(dir, false).and_then(|dir| {
+            if load_trust(&dir)?.forget(&name)? {
+                println!("forgot {name}");
+            } else {
+                println!("no paired Mac named {name:?} (see --peers)");
+            }
+            Ok(())
+        }),
+        Command::Run(run) => {
+            let dry_run = run.dry_run.is_some();
+            match config_dir(run.config_dir.clone(), dry_run).and_then(|dir| security(&dir)) {
+                Ok(security) => start(run, Arc::new(security)),
+                Err(e) => Err(e),
+            }
+        }
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn start(run: Run, security: Arc<Security>) -> io::Result<()> {
+    log!("this PC's key: {}", security.identity.fingerprint());
+    match &run.host {
+        Some(host) => log!("connecting to {host}:{}", run.port),
+        None => log!("looking for the Mac on the network"),
+    }
+    let config = Config::new(run.host, run.port, security);
+    match run.dry_run {
+        Some(displays) => {
+            let name = run.name.unwrap_or_else(|| "onemouse-dry-run".into());
+            log!("dry run as {name}: logging input instead of injecting it");
             client::run(
-                &Config::new(host, port),
+                &config,
                 Arc::new(StaticHost { name, displays }),
                 Arc::new(Mutex::new(Injector::new(LogBackend))),
             )
         }
-        command => platform::run(command),
+        None => platform::run(&config, run.name),
     }
 }
 
@@ -154,8 +284,6 @@ mod platform {
     use onemouse_win::{WindowsHost, display, log};
     use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 
-    use super::{Command, Run};
-
     static INJECTOR: OnceLock<SharedInjector<SendInputBackend>> = OnceLock::new();
 
     /// Ctrl+C, closing the console, logoff, shutdown: release everything before
@@ -167,27 +295,25 @@ mod platform {
         0
     }
 
-    pub fn run(command: Command) -> ExitCode {
+    pub fn list_displays() -> ExitCode {
         display::enable_dpi_awareness();
-        let Command::Run(Run {
-            host, port, name, ..
-        }) = command
-        else {
-            for d in display::displays() {
-                println!(
-                    "{:>10}  {}x{} at ({}, {})  scale {}{}",
-                    d.id,
-                    d.width,
-                    d.height,
-                    d.x,
-                    d.y,
-                    d.scale,
-                    if d.primary { "  primary" } else { "" }
-                );
-            }
-            return ExitCode::SUCCESS;
-        };
+        for d in display::displays() {
+            println!(
+                "{:>10}  {}x{} at ({}, {})  scale {}{}",
+                d.id,
+                d.width,
+                d.height,
+                d.x,
+                d.y,
+                d.scale,
+                if d.primary { "  primary" } else { "" }
+            );
+        }
+        ExitCode::SUCCESS
+    }
 
+    pub fn run(config: &Config, name: Option<String>) -> ! {
+        display::enable_dpi_awareness();
         let injector = Arc::new(Mutex::new(Injector::new(SendInputBackend)));
         let _ = INJECTOR.set(Arc::clone(&injector));
         // SAFETY: registering a handler with the right signature.
@@ -197,13 +323,8 @@ mod platform {
         let name = name
             .or_else(|| std::env::var("COMPUTERNAME").ok())
             .unwrap_or_else(|| "windows".into());
-        log!("onemouse-win: plaintext v1 protocol, trusted LAN only");
-        log!("connecting to {host}:{port} as {name}");
-        client::run(
-            &Config::new(host, port),
-            Arc::new(WindowsHost { name }),
-            injector,
-        )
+        log!("injecting input as {name}");
+        client::run(config, Arc::new(WindowsHost { name }), injector)
     }
 }
 
@@ -211,9 +332,19 @@ mod platform {
 mod platform {
     use std::process::ExitCode;
 
-    pub fn run(_: super::Command) -> ExitCode {
-        eprintln!("onemouse-win injects input only on Windows; use --dry-run to test elsewhere");
+    use onemouse_win::client::Config;
+
+    const ONLY_WINDOWS: &str =
+        "onemouse-win injects input only on Windows; use --dry-run to test elsewhere";
+
+    pub fn list_displays() -> ExitCode {
+        eprintln!("{ONLY_WINDOWS}");
         ExitCode::FAILURE
+    }
+
+    pub fn run(_: &Config, _: Option<String>) -> ! {
+        eprintln!("{ONLY_WINDOWS}");
+        std::process::exit(1)
     }
 }
 
@@ -227,10 +358,11 @@ mod tests {
 
     fn run(host: &str, port: u16, name: Option<&str>, dry_run: Option<Vec<Display>>) -> Command {
         Command::Run(Run {
-            host: host.into(),
+            host: Some(host.into()),
             port,
             name: name.map(Into::into),
             dry_run,
+            config_dir: None,
         })
     }
 
@@ -288,8 +420,47 @@ mod tests {
     }
 
     #[test]
+    fn parses_discovery_and_peer_management() {
+        assert_eq!(
+            parse(args("")),
+            Ok(Command::Run(Run {
+                host: None,
+                port: onemouse_protocol::DEFAULT_PORT,
+                name: None,
+                dry_run: None,
+                config_dir: None,
+            }))
+        );
+        assert_eq!(
+            parse(args("--peers --config-dir /tmp/om")),
+            Ok(Command::Peers {
+                config_dir: Some("/tmp/om".into())
+            })
+        );
+        assert_eq!(
+            parse(args("--forget MacBook")),
+            Ok(Command::Forget {
+                name: "MacBook".into(),
+                config_dir: None
+            })
+        );
+        assert!(parse(args("--forget")).is_err());
+    }
+
+    #[test]
+    fn dry_run_keeps_its_own_identity() {
+        let real = config_dir(None, false).unwrap();
+        let dry = config_dir(None, true).unwrap();
+        assert_ne!(real, dry);
+        assert!(dry.starts_with(&real));
+        assert_eq!(
+            config_dir(Some("/x".into()), true).unwrap(),
+            PathBuf::from("/x")
+        );
+    }
+
+    #[test]
     fn rejects_bad_args() {
-        assert!(parse(args("")).is_err());
         assert!(parse(args("--host")).is_err());
         assert!(parse(args("--host a --port x")).is_err());
         assert!(parse(args("--bogus")).is_err());

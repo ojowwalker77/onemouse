@@ -4,7 +4,9 @@
 //! The protocol handling, key table and held-key bookkeeping are portable and
 //! tested on every platform; the Win32 parts are behind `cfg(windows)`.
 //!
-//! Until M2 (Noise encryption) this is plaintext: dev use on a trusted LAN only.
+//! The connection is encrypted and authenticated with `onemouse-transport`:
+//! the first connection pairs (both screens show the same 6-digit code), later
+//! ones reconnect silently.
 
 pub mod client;
 pub mod inject;
