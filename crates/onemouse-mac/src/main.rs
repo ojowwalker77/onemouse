@@ -104,7 +104,7 @@ mod platform {
     use std::net::{TcpListener, UdpSocket};
     use std::process::ExitCode;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::Instant;
 
     use onemouse_mac::config::Config;
     use onemouse_mac::controller::Controller;
@@ -155,7 +155,10 @@ mod platform {
         let prompts = Arc::new(Prompts::default());
         let security = Arc::new(Security::new(security.0, security.1, {
             let prompts = Arc::clone(&prompts);
-            Box::new(move |req| prompts.ask(req, Duration::from_secs(60)))
+            Box::new(move |req| {
+                let left = req.deadline.saturating_duration_since(Instant::now());
+                prompts.ask(req, left)
+            })
         }));
 
         let name = name.unwrap_or_else(computer_name);

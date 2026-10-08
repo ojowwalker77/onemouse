@@ -409,6 +409,8 @@ mod tests {
     struct Pc {
         identity: Identity,
         trust: Mutex<TrustStore>,
+        /// Its own, as if in another process: the Mac uses the global one.
+        slot: onemouse_transport::PairingSlot,
     }
 
     impl Pc {
@@ -416,6 +418,7 @@ mod tests {
             Self {
                 identity: Identity::generate().unwrap(),
                 trust: Mutex::new(TrustStore::in_memory()),
+                slot: onemouse_transport::PairingSlot::new(),
             }
         }
 
@@ -438,6 +441,7 @@ mod tests {
             let opts = Options {
                 can_pair,
                 confirm: &|_| true,
+                pairing_slot: &self.slot,
                 ..Options::new(&self.identity, "pc", &self.trust)
             };
             let (mut s, _) = onemouse_transport::connect(tcp, &opts)?;

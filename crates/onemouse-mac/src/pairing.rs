@@ -52,6 +52,7 @@ mod tests {
             peer_name: "pc".into(),
             peer_fingerprint: "ab:cd".into(),
             code: code.into(),
+            deadline: std::time::Instant::now() + Duration::from_secs(60),
         }
     }
 

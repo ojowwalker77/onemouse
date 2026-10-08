@@ -2,7 +2,7 @@
 //! PC's, drawn to scale; drag the PC to where it sits on the desk.
 
 use std::cell::{Cell, RefCell};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
@@ -113,8 +113,6 @@ fn secondary(tap: &Tap) -> Option<(String, Vec<Display>, bool)> {
 
 /// How long "Pair a New PC…" stays open.
 const PAIRING_WINDOW: Duration = Duration::from_secs(120);
-/// How long the code dialog waits for the user (the PC gives up then too).
-const CONFIRM_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// First 8 hex digits, as people compare them.
 fn short(fingerprint: &str) -> &str {
@@ -275,11 +273,13 @@ impl Target {
         )));
         alert.addButtonWithTitle(&NSString::from_str("Pair"));
         alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+        // Closes itself when the handshake stops waiting for an answer.
+        let left = request.deadline.saturating_duration_since(Instant::now());
         // SAFETY: `self` implements `abortPairingDialog:`; the timer is
         // invalidated below, after the dialog closes.
         let timer = unsafe {
             NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
-                CONFIRM_TIMEOUT.as_secs_f64(),
+                left.as_secs_f64().max(0.1),
                 self,
                 sel!(abortPairingDialog:),
                 None,
