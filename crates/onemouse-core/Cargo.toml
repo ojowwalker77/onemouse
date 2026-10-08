@@ -1,0 +1,10 @@
+[package]
+name = "onemouse-core"
+description = "Portable onemouse logic: screen layout, input routing, shortcut translation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+onemouse-protocol.workspace = true

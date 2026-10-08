@@ -9,5 +9,6 @@ license = "MIT"
 repository = "https://github.com/ojowwalker77/onemouse"
 
 [workspace.dependencies]
+onemouse-core = { path = "crates/onemouse-core" }
 onemouse-protocol = { path = "crates/onemouse-protocol" }
 onemouse-transport = { path = "crates/onemouse-transport" }
