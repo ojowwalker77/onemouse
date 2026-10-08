@@ -7,6 +7,7 @@ onemouse-mac: share this Mac's keyboard and trackpad with a Windows PC
 
 USAGE:
     onemouse-mac [--side <side>] [--arrange] [--port <port>] [--name <name>] [--scroll-speed <x>]
+    onemouse-mac --install [<options>] | --uninstall
     onemouse-mac --list-displays
 
 OPTIONS:
@@ -16,6 +17,9 @@ OPTIONS:
     --port <port>        TCP port to listen on (default 24801)
     --name <name>        Name shown on the PC (default: this Mac's name)
     --scroll-speed <x>   Scroll speed multiplier on the PC (default 1.0)
+    --install            Start onemouse at login, without a terminal, with the
+                         given options (log: ~/Library/Logs/onemouse.log)
+    --uninstall          Stop starting at login and remove the installed copy
     --list-displays      Print this Mac's displays, then exit
     -h, --help           Show this help
 
@@ -35,6 +39,9 @@ enum Command {
         scroll_speed: f64,
         arrange: bool,
     },
+    /// Install the LaunchAgent with these run options.
+    Install(Vec<String>),
+    Uninstall,
     ListDisplays,
     Help,
 }
@@ -44,18 +51,28 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
     let (mut side, mut port, mut name) = (Side::Right, onemouse_protocol::DEFAULT_PORT, None);
     let mut scroll_speed = 1.0;
     let (mut list, mut arrange) = (false, false);
+    let (mut install, mut uninstall) = (false, false);
+    // Run options as given, to replay them from the LaunchAgent.
+    let mut keep = Vec::new();
     while let Some(arg) = args.next() {
+        let flag = arg.clone();
         let mut value = |flag: &str| args.next().ok_or(format!("{flag} needs a value"));
         match arg.as_str() {
             "--side" => {
                 let v = value("--side")?;
                 side = Side::parse(&v).ok_or(format!("invalid side: {v}"))?;
+                keep.extend([flag, v]);
             }
             "--port" => {
                 let v = value("--port")?;
                 port = v.parse().map_err(|_| format!("invalid port: {v}"))?;
+                keep.extend([flag, v]);
             }
-            "--name" => name = Some(value("--name")?),
+            "--name" => {
+                let v = value("--name")?;
+                name = Some(v.clone());
+                keep.extend([flag, v]);
+            }
             "--scroll-speed" => {
                 let v = value("--scroll-speed")?;
                 scroll_speed = v
@@ -63,8 +80,11 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
                     .ok()
                     .filter(|s: &f64| *s > 0.0)
                     .ok_or(format!("invalid scroll speed: {v}"))?;
+                keep.extend([flag, v]);
             }
             "--arrange" => arrange = true,
+            "--install" => install = true,
+            "--uninstall" => uninstall = true,
             "--list-displays" => list = true,
             "-h" | "--help" => return Ok(Command::Help),
             other => return Err(format!("unexpected argument: {other}")),
@@ -72,6 +92,12 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
     }
     if list {
         return Ok(Command::ListDisplays);
+    }
+    if uninstall {
+        return Ok(Command::Uninstall);
+    }
+    if install {
+        return Ok(Command::Install(keep));
     }
     Ok(Command::Run {
         side,
@@ -104,10 +130,11 @@ mod platform {
     use std::net::{TcpListener, UdpSocket};
     use std::process::ExitCode;
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use onemouse_mac::config::Config;
     use onemouse_mac::controller::Controller;
+    use onemouse_mac::install::{self, Paths};
     use onemouse_mac::pairing::Prompts;
     use onemouse_mac::server::{self, Link, Security};
     use onemouse_mac::{log, macos};
@@ -116,6 +143,11 @@ mod platform {
     use super::Command;
 
     pub fn run(command: Command) -> ExitCode {
+        let command = match command {
+            Command::Install(args) => return report(install(&args)),
+            Command::Uninstall => return report(uninstall()),
+            other => other,
+        };
         let Command::Run {
             side,
             port,
@@ -131,11 +163,17 @@ mod platform {
         };
 
         if !macos::ensure_permissions() {
+            // Wait rather than exit: at login, launchd would just restart us.
             log!(
-                "needs Accessibility and Input Monitoring: allow this terminal in \
-                 System Settings → Privacy & Security, then run again"
+                "waiting for Accessibility and Input Monitoring: allow {} in \
+                 System Settings → Privacy & Security",
+                std::env::current_exe()
+                    .map_or_else(|_| "onemouse-mac".into(), |p| p.display().to_string())
             );
-            return ExitCode::FAILURE;
+            while !macos::permissions_granted() {
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            log!("permissions granted");
         }
 
         let listener = match TcpListener::bind(("0.0.0.0", port)) {
@@ -213,6 +251,84 @@ mod platform {
         ))
     }
 
+    fn report(result: Result<String, String>) -> ExitCode {
+        match result {
+            Ok(done) => {
+                println!("{done}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+
+    unsafe extern "C" {
+        fn getuid() -> u32;
+    }
+
+    fn launchctl(args: &[&str]) -> std::io::Result<std::process::ExitStatus> {
+        std::process::Command::new("launchctl")
+            .args(args)
+            .stderr(std::process::Stdio::null())
+            .status()
+    }
+
+    /// The running agent's launchd target.
+    fn service() -> String {
+        // SAFETY: getuid can't fail.
+        format!("gui/{}/{}", unsafe { getuid() }, install::LABEL)
+    }
+
+    fn install(args: &[String]) -> Result<String, String> {
+        let paths = Paths::for_current_user().ok_or("HOME is not set")?;
+        let me = std::env::current_exe().map_err(|e| e.to_string())?;
+        let io = |what: &str, e: std::io::Error| format!("{what}: {e}");
+        // Stop a running copy first: it holds the port and the file.
+        let _ = launchctl(&["bootout", &service()]);
+        for dir in [&paths.exe, &paths.plist, &paths.log] {
+            if let Some(dir) = dir.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| io("creating folders", e))?;
+            }
+        }
+        if me != paths.exe {
+            std::fs::copy(&me, &paths.exe).map_err(|e| io("copying the binary", e))?;
+        }
+        std::fs::write(&paths.plist, install::plist(&paths, args))
+            .map_err(|e| io("writing the LaunchAgent", e))?;
+        // SAFETY: getuid can't fail.
+        let domain = format!("gui/{}", unsafe { getuid() });
+        let plist = paths.plist.to_string_lossy();
+        match launchctl(&["bootstrap", &domain, &plist]) {
+            Ok(s) if s.success() => {}
+            _ => return Err(format!("launchctl couldn't load {plist}")),
+        }
+        Ok(format!(
+            "onemouse now starts at login (and is starting now).\n\
+             First time only: in System Settings → Privacy & Security, allow\n  {}\n\
+             under both Accessibility and Input Monitoring.\n\
+             Log: {}\n\
+             After rebuilding onemouse, run --install again (and re-allow it).",
+            paths.exe.display(),
+            paths.log.display()
+        ))
+    }
+
+    fn uninstall() -> Result<String, String> {
+        let paths = Paths::for_current_user().ok_or("HOME is not set")?;
+        let _ = launchctl(&["bootout", &service()]);
+        for file in [&paths.plist, &paths.exe] {
+            match std::fs::remove_file(file) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(format!("removing {}: {e}", file.display()));
+                }
+                _ => {}
+            }
+        }
+        Ok("onemouse no longer starts at login. Your pairing and arrangement are kept.".into())
+    }
+
     fn computer_name() -> String {
         std::process::Command::new("scutil")
             .args(["--get", "ComputerName"])
@@ -283,6 +399,22 @@ mod tests {
         assert!(parse(args("--scroll-speed 0")).is_err());
         assert!(parse(args("--bogus")).is_err());
         assert_eq!(parse(args("--list-displays")), Ok(Command::ListDisplays));
+        assert_eq!(parse(args("--uninstall")), Ok(Command::Uninstall));
         assert_eq!(parse(args("--side left -h")), Ok(Command::Help));
+    }
+
+    #[test]
+    fn install_keeps_only_the_run_options() {
+        assert_eq!(
+            parse(args(
+                "--install --side left --arrange --name air --port 9000"
+            )),
+            Ok(Command::Install(
+                ["--side", "left", "--name", "air", "--port", "9000"]
+                    .map(String::from)
+                    .to_vec()
+            ))
+        );
+        assert!(parse(args("--install --side up")).is_err());
     }
 }

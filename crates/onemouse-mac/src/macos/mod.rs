@@ -56,6 +56,12 @@ pub fn ensure_permissions() -> bool {
     }
 }
 
+/// Whether both permissions are granted now, without prompting.
+pub fn permissions_granted() -> bool {
+    // SAFETY: no arguments.
+    unsafe { AXIsProcessTrusted() != 0 && CGPreflightListenEventAccess() }
+}
+
 /// The Mac's displays in global points.
 pub fn displays() -> Vec<Rect> {
     let mut ids = [0; 16];
