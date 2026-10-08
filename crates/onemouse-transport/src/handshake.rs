@@ -161,7 +161,9 @@ fn establish(
     let previous_timeout = stream.read_timeout()?;
     stream.set_read_timeout(Some(opts.handshake_timeout))?;
     let result = establish_inner(stream.try_clone()?, opts, initiator);
-    stream.set_read_timeout(previous_timeout)?;
+    // Best effort: macOS returns EINVAL for setsockopt once the peer has
+    // closed, and the handshake's own result matters more.
+    let _ = stream.set_read_timeout(previous_timeout);
     result
 }
 
@@ -295,7 +297,9 @@ fn exchange_trust(
         .pairing_timeout
         .saturating_sub(started.elapsed())
         .max(Duration::from_millis(1));
-    tcp.set_read_timeout(Some(remaining))?;
+    // Best effort (see `establish`): if the peer already closed, the read
+    // below reports it, e.g. after its `[0]`.
+    let _ = tcp.set_read_timeout(Some(remaining));
     let answer = match read_record(secure) {
         Ok(answer) => answer,
         Err(Error::Io(e))
