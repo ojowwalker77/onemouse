@@ -165,6 +165,7 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub static kAXTrustedCheckOptionPrompt: CFStringRef;
     pub fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> u8;
+    pub fn AXIsProcessTrusted() -> u8;
 }
 
 #[link(name = "Carbon", kind = "framework")]
