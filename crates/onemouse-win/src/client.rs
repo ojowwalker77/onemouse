@@ -28,6 +28,23 @@ pub trait Host: Send + Sync + 'static {
     }
 }
 
+/// A host with a fixed name and display layout (`--dry-run`, tests).
+#[derive(Debug, Clone)]
+pub struct StaticHost {
+    pub name: String,
+    pub displays: Vec<Display>,
+}
+
+impl Host for StaticHost {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn displays(&self) -> Vec<Display> {
+        self.displays.clone()
+    }
+}
+
 pub type SharedInjector<B> = Arc<Mutex<Injector<B>>>;
 
 pub fn lock<B>(injector: &SharedInjector<B>) -> MutexGuard<'_, Injector<B>> {
@@ -340,12 +357,14 @@ impl Session {
     ) -> Result<Option<Message>, ClientError> {
         let result = match msg {
             Message::Enter { x, y } => {
+                log!("cursor entered at ({x}, {y})");
                 // Nothing is held on entry: clear anything left from before.
                 inj.release_all();
                 self.entered = true;
                 inj.move_to(x, y)
             }
             Message::Leave => {
+                log!("cursor left");
                 inj.release_all();
                 self.entered = false;
                 Ok(())

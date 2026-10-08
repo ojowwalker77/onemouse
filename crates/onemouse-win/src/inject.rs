@@ -130,6 +130,55 @@ impl<B: Backend> Injector<B> {
     }
 }
 
+/// A [`Backend`] that prints what it would inject (`--dry-run`), so the
+/// whole secondary can run on any OS.
+#[derive(Debug, Default)]
+pub struct LogBackend;
+
+impl LogBackend {
+    fn key_name(key: KeyTarget) -> &'static str {
+        onemouse_protocol::key::ALL
+            .iter()
+            .find(|(_, code)| keymap::lookup(*code) == Some(key))
+            .map_or("?", |(name, _)| name)
+    }
+}
+
+impl Backend for LogBackend {
+    fn move_to(&mut self, x: i32, y: i32) -> io::Result<()> {
+        crate::log!("inject: move to ({x}, {y})");
+        Ok(())
+    }
+
+    fn button(&mut self, button: MouseButton, pressed: bool) -> io::Result<()> {
+        let action = if pressed { "down" } else { "up" };
+        crate::log!("inject: {button:?} button {action}");
+        Ok(())
+    }
+
+    fn wheel(&mut self, delta: i32) -> io::Result<()> {
+        crate::log!("inject: wheel {delta:+}");
+        Ok(())
+    }
+
+    fn hwheel(&mut self, delta: i32) -> io::Result<()> {
+        crate::log!("inject: hwheel {delta:+}");
+        Ok(())
+    }
+
+    fn key(&mut self, key: KeyTarget, pressed: bool) -> io::Result<()> {
+        let action = if pressed { "down" } else { "up" };
+        let how = match key {
+            KeyTarget::Scan { code, extended } => {
+                format!("scan {}{code:#04x}", if extended { "E0 " } else { "" })
+            }
+            KeyTarget::Vk(vk) => format!("vk {vk:#04x}"),
+        };
+        crate::log!("inject: key {} ({how}) {action}", Self::key_name(key));
+        Ok(())
+    }
+}
+
 /// A [`Backend`] that records calls, for tests on any platform.
 #[derive(Debug, Default, Clone)]
 pub struct RecordingBackend {
