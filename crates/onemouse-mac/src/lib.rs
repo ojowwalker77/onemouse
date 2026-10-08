@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod controller;
+pub mod install;
 pub mod keymap;
 pub mod layout;
 pub mod pairing;
@@ -20,6 +21,17 @@ pub mod macos;
 #[doc(hidden)]
 macro_rules! log {
     ($($arg:tt)*) => {
-        eprintln!("[onemouse-mac] {}", format_args!($($arg)*))
+        eprintln!("[onemouse-mac {}] {}", $crate::clock(), format_args!($($arg)*))
     };
+}
+
+/// `HH:MM:SSZ` (UTC) for log lines, which end up in a file when running at
+/// login.
+#[doc(hidden)]
+pub fn clock() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let day = secs % 86_400;
+    format!("{:02}:{:02}:{:02}Z", day / 3600, day % 3600 / 60, day % 60)
 }

@@ -60,6 +60,10 @@ pub(super) fn run(tap: &'static Tap) {
     );
     key.setEnabled(false);
     menu.addItem(&key);
+    let open_log = item(mtm, "Open Log", Some(sel!(openLog:)));
+    // SAFETY: `target` implements `openLog:` and outlives the menu.
+    unsafe { open_log.setTarget(Some(&target)) };
+    menu.addItem(&open_log);
     menu.addItem(&item(mtm, "Quit onemouse", Some(sel!(terminate:))));
     status.setMenu(Some(&menu));
     *target.ivars().status_line.borrow_mut() = Some(status_line);
@@ -152,6 +156,18 @@ define_class!(
                 log!("pairing open for {} s: start onemouse-win on the PC", PAIRING_WINDOW.as_secs());
             }
             self.update_status_title();
+        }
+
+        #[unsafe(method(openLog:))]
+        fn open_log(&self, _sender: Option<&AnyObject>) {
+            // Only exists when started at login (`--install`); from a
+            // terminal the log is the terminal.
+            match crate::install::Paths::for_current_user().map(|p| p.log) {
+                Some(log) if log.exists() => {
+                    let _ = std::process::Command::new("open").arg(log).spawn();
+                }
+                _ => log!("no log file: onemouse is logging to the terminal it runs in"),
+            }
         }
 
         #[unsafe(method(abortPairingDialog:))]
