@@ -36,6 +36,8 @@ The ⇄ menu-bar item also opens **Arrange Displays**: drag the PC next to your 
 
 **Start at login, no terminal:** `cargo run --release -p onemouse-mac -- --install` installs a LaunchAgent with the same options (e.g. `--install --side left`). The first time, allow the installed copy (`~/Library/Application Support/onemouse/onemouse-mac`) under **Accessibility** and **Input Monitoring**. It waits until you do. The log is in `~/Library/Logs/onemouse.log` (⇄ → Open Log). `--uninstall` undoes it and keeps your pairing and arrangement. After rebuilding, run `--install` again.
 
+**Keyboard and Mouse → On This Mac / On the PC** (in the ⇄ menu, or the PC's tray menu) picks the machine whose keyboard and mouse you use. Either way the cursor crosses where the screens touch, and shortcuts are translated for the other OS (Cmd+C ↔ Ctrl+C, Cmd+Tab ↔ Alt+Tab, …).
+
 Everything is encrypted (Noise XX) between devices that paired once; see [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 
 To test without a PC, run `cargo run -p onemouse-win -- --dry-run` (it keeps its own key under `…/onemouse/dry-run`, so it pairs separately from the real app), or run `cargo run -p onemouse-mac --example simulate` for a scripted session that doesn't touch your input.

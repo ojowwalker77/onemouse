@@ -9,13 +9,13 @@ use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicy,
-    NSBackingStoreType, NSBezierPath, NSColor, NSEvent, NSFont, NSFontAttributeName,
-    NSForegroundColorAttributeName, NSMenu, NSMenuDelegate, NSMenuItem, NSModalPanelRunLoopMode,
-    NSStatusBar, NSStatusItem, NSStringDrawing, NSVariableStatusItemLength, NSView, NSWindow,
-    NSWindowStyleMask,
+    NSBackingStoreType, NSBezierPath, NSColor, NSControlStateValueOff, NSControlStateValueOn,
+    NSEvent, NSFont, NSFontAttributeName, NSForegroundColorAttributeName, NSMenu, NSMenuDelegate,
+    NSMenuItem, NSModalPanelRunLoopMode, NSStatusBar, NSStatusItem, NSStringDrawing,
+    NSVariableStatusItemLength, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSDictionary, NSPoint, NSRect, NSRunLoop, NSSize, NSString, NSTimer};
-use onemouse_protocol::Display;
+use onemouse_protocol::{Display, Main};
 use onemouse_transport::PairingRequest;
 
 use super::{Tap, displays};
@@ -40,6 +40,18 @@ pub(super) fn run(tap: &'static Tap) {
     let status_line = item(mtm, "Waiting for the PC…", None);
     status_line.setEnabled(false);
     menu.addItem(&status_line);
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    let heading = item(mtm, "Keyboard and Mouse", None);
+    heading.setEnabled(false);
+    menu.addItem(&heading);
+    let on_mac = item(mtm, "On This Mac", Some(sel!(mainOnMac:)));
+    let on_pc = item(mtm, "On the PC", Some(sel!(mainOnPc:)));
+    for choice in [&on_mac, &on_pc] {
+        choice.setIndentationLevel(1);
+        // SAFETY: `target` implements both actions and outlives the menu.
+        unsafe { choice.setTarget(Some(&target)) };
+        menu.addItem(choice);
+    }
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     let arrange = item(mtm, "Arrange Displays…", Some(sel!(openArrange:)));
     // SAFETY: `target` implements `openArrange:` and outlives the menu.
@@ -68,6 +80,7 @@ pub(super) fn run(tap: &'static Tap) {
     status.setMenu(Some(&menu));
     *target.ivars().status_line.borrow_mut() = Some(status_line);
     *target.ivars().pair_item.borrow_mut() = Some(pair);
+    *target.ivars().main_items.borrow_mut() = Some((on_mac, on_pc));
 
     // SAFETY: `target` implements `tick:`; the timer retains it.
     unsafe {
@@ -128,6 +141,8 @@ pub(super) struct TargetIvars {
     status: RefCell<Option<Retained<NSStatusItem>>>,
     status_line: RefCell<Option<Retained<NSMenuItem>>>,
     pair_item: RefCell<Option<Retained<NSMenuItem>>>,
+    /// "On This Mac", "On the PC".
+    main_items: RefCell<Option<(Retained<NSMenuItem>, Retained<NSMenuItem>)>>,
     window: RefCell<Option<Retained<NSWindow>>>,
     view: RefCell<Option<Retained<ArrangeView>>>,
 }
@@ -158,6 +173,16 @@ define_class!(
             self.update_status_title();
         }
 
+        #[unsafe(method(mainOnMac:))]
+        fn main_on_mac(&self, _sender: Option<&AnyObject>) {
+            self.choose_main(Main::Server);
+        }
+
+        #[unsafe(method(mainOnPc:))]
+        fn main_on_pc(&self, _sender: Option<&AnyObject>) {
+            self.choose_main(Main::Client);
+        }
+
         #[unsafe(method(openLog:))]
         fn open_log(&self, _sender: Option<&AnyObject>) {
             // Only exists when started at login (`--install`); from a
@@ -182,6 +207,7 @@ define_class!(
                 let _ = answer.send(self.confirm_pairing(&request));
             }
             self.remember_displays();
+            self.sync_link();
             if let Some(window) = &*self.ivars().window.borrow()
                 && window.isVisible()
                 && let Some(view) = &*self.ivars().view.borrow()
@@ -210,6 +236,12 @@ define_class!(
             if let Some(item) = &*self.ivars().pair_item.borrow() {
                 item.setTitle(&NSString::from_str(&pair));
             }
+            let main = self.ivars().tap.link.main();
+            if let Some((on_mac, on_pc)) = &*self.ivars().main_items.borrow() {
+                let state = |on| if on { NSControlStateValueOn } else { NSControlStateValueOff };
+                on_mac.setState(state(main == Main::Server));
+                on_pc.setState(state(main == Main::Client));
+            }
         }
     }
 );
@@ -221,6 +253,7 @@ impl Target {
             status: RefCell::new(None),
             status_line: RefCell::new(None),
             pair_item: RefCell::new(None),
+            main_items: RefCell::new(None),
             window: RefCell::new(None),
             view: RefCell::new(None),
         });
@@ -317,6 +350,36 @@ impl Target {
             if paired { "confirmed" } else { "declined" }
         );
         paired
+    }
+
+    fn choose_main(&self, main: Main) {
+        let tap = self.ivars().tap;
+        super::choose_main(tap, main);
+        self.sync_link();
+    }
+
+    /// Keeps the PC up to date with this Mac's displays and where the PC
+    /// sits, and remembers the keyboard-and-mouse setting (the PC may have
+    /// changed it).
+    fn sync_link(&self) {
+        let tap = self.ivars().tap;
+        let main = tap.link.main();
+        if main == Main::Client {
+            // The PC took over while the cursor was on it.
+            super::come_home(tap);
+        }
+        if tap.config.borrow().main_or_default() != main {
+            tap.config.borrow_mut().main = Some(main);
+            save(tap);
+        }
+        let mac = displays();
+        tap.link.set_displays(super::protocol_displays());
+        if let Some((_, pc, _)) = secondary(tap)
+            && let Some(origin) = tap.controller.borrow().origin(&mac, &pc)
+        {
+            tap.link
+                .set_arrangement((origin.x.round() as i32, origin.y.round() as i32));
+        }
     }
 
     /// Keeps the last seen PC layout so it can be arranged while offline.
