@@ -249,12 +249,11 @@ fn renamed_peer_with_a_known_key_connects_and_updates_the_name() {
 #[test]
 fn slow_confirmation_times_out() {
     let (pc, mut mac) = (Side::new("desk"), Side::new("macbook"));
-    mac.delay = Duration::from_millis(800);
+    // Well past the 500 ms limit: Windows receive timeouts can overshoot.
+    mac.delay = Duration::from_secs(2);
     let (client, server) = run(&pc, &mac);
-    assert!(
-        matches!(client.unwrap_err(), Error::PairingTimeout),
-        "pc gave up waiting"
-    );
+    let client = client.unwrap_err();
+    assert!(matches!(client, Error::PairingTimeout), "{client:?}");
     assert!(matches!(
         server.unwrap_err(),
         Error::Declined { by_peer: false } | Error::Io(_)
