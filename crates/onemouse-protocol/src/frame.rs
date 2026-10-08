@@ -103,6 +103,9 @@ mod tests {
             Message::Welcome {
                 protocol_version: PROTOCOL_VERSION,
                 name: "macbook".into(),
+                os: Os::MacOs,
+                displays: vec![display.clone()],
+                main: Main::Client,
             },
             Message::Reject {
                 reason: "version mismatch".into(),
@@ -124,6 +127,8 @@ mod tests {
             },
             Message::Ping(u64::MAX),
             Message::Pong(0),
+            Message::SetMain { main: Main::Server },
+            Message::Arrangement { x: 1440, y: -120 },
         ]
     }
 
@@ -164,6 +169,25 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(hello, [6, 0, 0, 0, 0, 1, 1, b'w', 1, 0]);
+    }
+
+    /// An older peer reads a newer `Welcome` far enough to see the version
+    /// and refuse cleanly: the fields it knows come first, unchanged.
+    #[test]
+    fn welcome_starts_with_version_and_name() {
+        let frame = encode(&Message::Welcome {
+            protocol_version: 3,
+            name: "m".into(),
+            os: Os::MacOs,
+            displays: vec![],
+            main: Main::Server,
+        })
+        .unwrap();
+        assert_eq!(frame[4..], [1, 3, 1, b'm', 0, 0, 0]);
+        assert_eq!(
+            encode(&Message::SetMain { main: Main::Client }).unwrap(),
+            [2, 0, 0, 0, 12, 1]
+        );
     }
 
     #[test]
