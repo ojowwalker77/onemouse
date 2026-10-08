@@ -4,7 +4,7 @@
 use std::cell::Cell;
 use std::fmt;
 use std::io::{self, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -17,6 +17,9 @@ use crate::identity::{Identity, PublicKey, fingerprint};
 use crate::secure::{SecureStream, halves, read_exact_by};
 use crate::trust::{Trust, TrustStore, sanitize_name};
 use crate::{NOISE_PARAMS, PROLOGUE};
+
+/// How long a decliner waits for the peer's answer before closing.
+const DECLINE_LINGER: Duration = Duration::from_secs(2);
 
 /// Longest device name carried in the handshake.
 pub const MAX_NAME_LEN: usize = 255;
@@ -383,6 +386,12 @@ fn exchange_trust(
     let accepted = (opts.confirm)(&request) && Instant::now() < pairing_deadline;
     secure.writer.write_record(&[accepted.into()])?;
     if !accepted {
+        // Close gracefully so the peer reads our `[0]`: on Windows, closing
+        // with its answer still unread sends a reset, which discards the
+        // `[0]` from the peer's receive buffer ("connection aborted").
+        let _ = secure.tcp().shutdown(Shutdown::Write);
+        let linger = pairing_deadline.min(Instant::now() + DECLINE_LINGER);
+        let _ = read_record(secure, linger);
         return Err(Error::Declined { by_peer: false });
     }
     let answer = match read_record(secure, pairing_deadline) {
