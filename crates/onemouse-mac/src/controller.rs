@@ -568,4 +568,20 @@ mod tests {
         let out = c.handle(mv(640.0, 831.0, 0.0, 2.0), MAC, peer(&pc));
         assert_eq!(out.send[0], Message::Enter { x: 640, y: 1 });
     }
+
+    #[test]
+    fn layout_shrinking_while_remote_clamps_the_next_move() {
+        let mut c = Controller::new(Side::Right, None);
+        let pc = pc(1.0);
+        cross(&mut c, &pc);
+        c.handle(mv(1279.0, 416.0, 100.0, 0.0), MAC, peer(&pc));
+
+        // Same connection, the monitor under the cursor got smaller.
+        let smaller = vec![Display {
+            width: 50,
+            ..pc[0].clone()
+        }];
+        let out = c.handle(mv(1279.0, 416.0, 1.0, 0.0), MAC, peer(&smaller));
+        assert_eq!(out.send, [Message::MouseMove { x: 49, y: 540 }]);
+    }
 }
