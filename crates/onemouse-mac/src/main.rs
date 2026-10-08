@@ -179,7 +179,9 @@ mod platform {
             lan_ip().unwrap_or_else(|| "0.0.0.0".into())
         );
         log!("Ctrl+Option+Cmd+Esc brings the cursor back");
-        let config_path = Config::default_path();
+        let config_path = onemouse_transport::config_dir()
+            .ok()
+            .map(|dir| dir.join("arrangement"));
         let config = config_path.as_deref().map(Config::load).unwrap_or_default();
         log!("arrange the PC from the ⇄ menu-bar item");
         let controller = Controller::new(side, config.origin);

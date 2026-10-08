@@ -1,16 +1,18 @@
-//! Remembers the arrangement, and the secondary's displays so it can be
-//! arranged while disconnected. Plain text, one item per line:
+//! Remembers the arrangement, which side has the keyboard and mouse, and
+//! the secondary's displays so it can be arranged while disconnected.
+//! Plain text, one item per line:
 //!
 //! ```text
 //! origin 1470 46
+//! main client
 //! display 1 0 0 1920 1080 1.25 primary
 //! ```
 
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use onemouse_protocol::Display;
+use onemouse_protocol::{Display, Main};
 
 use crate::layout::Point;
 
@@ -18,13 +20,15 @@ use crate::layout::Point;
 pub struct Config {
     pub origin: Option<Point>,
     pub displays: Vec<Display>,
+    /// Which side has the keyboard and mouse, if the user ever chose.
+    /// `None` means the historical default: the server (the Mac).
+    pub main: Option<Main>,
 }
 
 impl Config {
-    /// `~/Library/Application Support/onemouse/arrangement`.
-    pub fn default_path() -> Option<PathBuf> {
-        let home = std::env::var_os("HOME")?;
-        Some(Path::new(&home).join("Library/Application Support/onemouse/arrangement"))
+    /// The effective setting: an explicit choice, else the server.
+    pub fn main_or_default(&self) -> Main {
+        self.main.unwrap_or(Main::Server)
     }
 
     /// A missing or unreadable file is an empty config; bad lines are skipped.
@@ -54,6 +58,13 @@ impl Config {
                         config.origin = Some(Point::new(x, y));
                     }
                 }
+                ["main", which] => {
+                    config.main = match *which {
+                        "server" => Some(Main::Server),
+                        "client" => Some(Main::Client),
+                        _ => None,
+                    };
+                }
                 ["display", id, x, y, w, h, scale, rest @ ..] => {
                     let display = (|| {
                         Some(Display {
@@ -80,6 +91,16 @@ impl std::fmt::Display for Config {
         if let Some(o) = self.origin {
             writeln!(f, "origin {} {}", o.x, o.y)?;
         }
+        if let Some(main) = self.main {
+            writeln!(
+                f,
+                "main {}",
+                match main {
+                    Main::Server => "server",
+                    Main::Client => "client",
+                }
+            )?;
+        }
         for d in &self.displays {
             writeln!(
                 f,
@@ -104,6 +125,7 @@ mod tests {
     fn sample() -> Config {
         Config {
             origin: Some(Point::new(1470.0, -46.5)),
+            main: Some(Main::Client),
             displays: vec![
                 Display {
                     id: 7,
@@ -156,7 +178,27 @@ mod tests {
                     scale: 1.5,
                     primary: false,
                 }],
+                ..Default::default()
             }
+        );
+    }
+
+    #[test]
+    fn main_defaults_to_the_server_and_round_trips() {
+        assert_eq!(Config::default().main_or_default(), Main::Server);
+        assert_eq!(
+            Config::parse("main client\n").main_or_default(),
+            Main::Client
+        );
+        assert_eq!(
+            Config::parse("main server\n").main_or_default(),
+            Main::Server
+        );
+        // Junk keeps the default; a later valid line wins.
+        assert_eq!(Config::parse("main pc\n").main_or_default(), Main::Server);
+        assert_eq!(
+            Config::parse("main pc\nmain client\n").main_or_default(),
+            Main::Client
         );
     }
 }

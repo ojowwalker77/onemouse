@@ -1,14 +1,19 @@
-//! Decides, for every captured input event, whether it stays on the Mac or
-//! goes to the secondary, and what to send. Pure logic: the macOS event tap
+//! Decides, for every captured input event, whether it stays local or goes
+//! to the secondary, and what to send. Pure logic: the platform event tap
 //! feeds it and applies the result.
+//!
+//! Keys sent while remote go through [`Translator`]: translation runs on the
+//! main side, so the wire carries already-translated keys and the protocol
+//! is unchanged. The translator is reset on every `Enter`/`Leave`, matching
+//! the peer (which releases all keys then).
 
 use std::collections::BTreeSet;
 
 use onemouse_protocol::key::{self, KeyCode};
-use onemouse_protocol::{Display, Message, MouseButton};
+use onemouse_protocol::{Display, Message, MouseButton, Os};
 
-use crate::keymap;
 use crate::layout::{self, Placed, Point, Rect, Side, Step};
+use crate::translate::Translator;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Input {
@@ -79,18 +84,28 @@ pub struct Controller {
     state: State,
     /// Physical keys currently down, wherever they went.
     held_keys: BTreeSet<KeyCode>,
-    /// Mouse buttons down on the Mac. No crossing mid-drag.
+    /// Mouse buttons down locally. No crossing mid-drag.
     held_buttons: u32,
+    /// Main-side shortcut translation (physical in, translated out).
+    translator: Translator,
 }
 
 impl Controller {
+    /// Mac as the main machine, Windows/Linux secondary.
     pub fn new(side: Side, arrangement: Option<Point>) -> Self {
+        Self::for_direction(Os::MacOs, Os::Windows, side, arrangement)
+    }
+
+    /// Either OS as the main machine; the [`Translator`] runs the shared
+    /// table in that direction (Windows-as-main uses `PC → Mac`).
+    pub fn for_direction(from: Os, to: Os, side: Side, arrangement: Option<Point>) -> Self {
         Self {
             side,
             arrangement,
             state: State::Local,
             held_keys: BTreeSet::new(),
             held_buttons: 0,
+            translator: Translator::new(from, to),
         }
     }
 
@@ -132,7 +147,7 @@ impl Controller {
                 let mut send = if *entered == peer.id {
                     Vec::new()
                 } else {
-                    self.reenter(peer)
+                    self.reenter(peer, &input)
                 };
                 let mut out = self.remote(input, mac, peer.displays);
                 send.append(&mut out.send);
@@ -175,7 +190,7 @@ impl Controller {
         };
         Output {
             swallow: true,
-            send: self.enter_messages(pos),
+            send: self.enter_messages(pos, None),
             went_remote: true,
             went_local: None,
         }
@@ -183,7 +198,7 @@ impl Controller {
 
     /// Repeats `Enter` to a new connection, at the same spot if it still
     /// exists on the secondary's (possibly changed) displays.
-    fn reenter(&mut self, peer: Peer) -> Vec<Message> {
+    fn reenter(&mut self, peer: Peer, current: &Input) -> Vec<Message> {
         let State::Remote { pos, peer: id, .. } = &mut self.state else {
             return Vec::new();
         };
@@ -193,24 +208,41 @@ impl Controller {
         *pos = Rect::from_display(display).clamp(*pos);
         *id = peer.id;
         let pos = *pos;
-        self.enter_messages(pos)
+        // The current input is fed to the translator by `remote()` next;
+        // don't replay it here (a modifier would go down twice).
+        let skip = match current {
+            Input::Key {
+                code,
+                pressed: true,
+            } => Some(*code),
+            _ => None,
+        };
+        self.enter_messages(pos, skip)
     }
 
-    fn enter_messages(&self, pos: Point) -> Vec<Message> {
+    /// `Enter` plus the translated modifiers held while crossing
+    /// (Cmd-drag, Shift-click… carry over). Only modifiers carry over; the
+    /// translator holds back a deferred one (Ctrl alone) until a key needs it.
+    fn enter_messages(&mut self, pos: Point, skip: Option<KeyCode>) -> Vec<Message> {
+        self.translator.reset();
         let mut send = vec![Message::Enter {
             x: pos.x.round() as i32,
             y: pos.y.round() as i32,
         }];
-        // Modifiers held while crossing (Cmd-drag, Shift-click…) carry over.
-        send.extend(
-            self.held_keys
-                .iter()
-                .filter(|code| code.is_modifier())
-                .map(|&code| Message::Key {
-                    code: keymap::to_secondary(code),
-                    pressed: true,
-                }),
-        );
+        let held: Vec<KeyCode> = self
+            .held_keys
+            .iter()
+            .filter(|code| code.is_modifier() && Some(**code) != skip)
+            .copied()
+            .collect();
+        for code in held {
+            for (translated, pressed) in self.translator.key(code, true) {
+                send.push(Message::Key {
+                    code: translated,
+                    pressed,
+                });
+            }
+        }
         send
     }
 
@@ -247,6 +279,7 @@ impl Controller {
                 }
             }
             Input::Button { button, pressed } => {
+                let button = self.translator.button(button, pressed);
                 send.push(Message::MouseButton { button, pressed });
             }
             Input::Scroll { dx, dy } => {
@@ -266,10 +299,12 @@ impl Controller {
                 if code == key::ESCAPE && pressed && self.escape_chord_held() {
                     return self.go_local(None, true);
                 }
-                send.push(Message::Key {
-                    code: keymap::to_secondary(code),
-                    pressed,
-                });
+                for (translated, pressed) in self.translator.key(code, pressed) {
+                    send.push(Message::Key {
+                        code: translated,
+                        pressed,
+                    });
+                }
             }
             Input::Gesture => {}
         }
@@ -289,12 +324,14 @@ impl Controller {
             && held(key::LEFT_META, key::RIGHT_META)
     }
 
-    /// Back to the Mac at `at`, or where the cursor left it.
+    /// Back to the local machine at `at`, or where the cursor left it.
+    /// The peer releases all keys on `Leave`; forget the translation state.
     fn go_local(&mut self, at: Option<Point>, tell_peer: bool) -> Output {
         let State::Remote { exit, .. } = self.state else {
             return Output::default();
         };
         self.state = State::Local;
+        self.translator.reset();
         Output {
             swallow: true,
             send: if tell_peer {
@@ -409,11 +446,37 @@ mod tests {
         assert_eq!(out.send, [Message::MouseMove { x: 21, y: 537 }]);
 
         let out = c.handle(key(key::LEFT_CTRL, true), MAC, peer(&pc));
+        // A lone Ctrl is held back (it would become the Windows key); it
+        // goes out once another key needs it.
+        assert_eq!(out.send, []);
+        let out = c.handle(key(key::A, true), MAC, peer(&pc));
+        assert_eq!(
+            out.send,
+            [
+                Message::Key {
+                    code: key::LEFT_META,
+                    pressed: true
+                },
+                Message::Key {
+                    code: key::A,
+                    pressed: true
+                },
+            ]
+        );
+        let out = c.handle(key(key::A, false), MAC, peer(&pc));
+        assert_eq!(
+            out.send,
+            [Message::Key {
+                code: key::A,
+                pressed: false
+            }]
+        );
+        let out = c.handle(key(key::LEFT_CTRL, false), MAC, peer(&pc));
         assert_eq!(
             out.send,
             [Message::Key {
                 code: key::LEFT_META,
-                pressed: true
+                pressed: false
             }]
         );
         let out = c.handle(
@@ -433,6 +496,52 @@ mod tests {
         );
         let out = c.handle(Input::Gesture, MAC, peer(&pc));
         assert!(out.swallow && out.send.is_empty());
+    }
+
+    #[test]
+    fn remote_shortcuts_use_the_shared_table() {
+        let mut c = Controller::new(Side::Right, None);
+        let displays = pc(1.0);
+        cross(&mut c, &displays);
+
+        // Cmd+C while remote arrives as Ctrl+C.
+        let out = c.handle(key(key::LEFT_META, true), MAC, peer(&displays));
+        assert_eq!(
+            out.send,
+            [Message::Key {
+                code: key::LEFT_CTRL,
+                pressed: true
+            }]
+        );
+        let out = c.handle(key(key::C, true), MAC, peer(&displays));
+        assert_eq!(
+            out.send,
+            [Message::Key {
+                code: key::C,
+                pressed: true
+            }]
+        );
+
+        // Ctrl-click while remote is a right click, without the Windows key.
+        let mut c = Controller::new(Side::Right, None);
+        let second = pc(1.0);
+        cross(&mut c, &second);
+        c.handle(key(key::LEFT_CTRL, true), MAC, peer(&second));
+        let out = c.handle(
+            Input::Button {
+                button: MouseButton::Left,
+                pressed: true,
+            },
+            MAC,
+            peer(&second),
+        );
+        assert_eq!(
+            out.send,
+            [Message::MouseButton {
+                button: MouseButton::Right,
+                pressed: true
+            }]
+        );
     }
 
     #[test]

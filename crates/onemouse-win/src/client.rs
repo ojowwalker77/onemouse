@@ -6,17 +6,20 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use onemouse_core::layout::Point;
 use onemouse_protocol::{
-    Display, FrameError, Hello, Message, Os, PROTOCOL_VERSION, read_message, write_message,
+    Display, FrameError, Hello, Main, Message, Os, PROTOCOL_VERSION, read_message, write_message,
 };
 
 use onemouse_transport::{Identity, PairingRequest, TrustStore, discovery, fingerprint};
 
+use crate::capture::{self, ServerInfo};
 use crate::inject::{Backend, Injector};
 use crate::log;
 
@@ -29,10 +32,13 @@ pub trait Host: Send + Sync + 'static {
     fn display_generation(&self) -> u64 {
         0
     }
-
-    /// Short connection status for the UI (tray tooltip), e.g.
-    /// "Connected to jow's MacBook Air".
     fn status(&self, _status: &str) {}
+    /// The persisted "keyboard & mouse are on" setting. Defaults to the
+    /// server (today's behavior); the server's is authoritative at connect.
+    fn main_setting(&self) -> Main {
+        Main::Server
+    }
+    fn set_main_setting(&self, _main: Main) {}
 }
 
 /// A host with a fixed name and display layout (`--dry-run`, tests).
@@ -188,18 +194,190 @@ impl Backoff {
     }
 }
 
+/// Who has the keyboard and mouse, shared by the session (which adopts the
+/// server's word: `Welcome.main`, `SetMain`) and the UI (the user's word).
+/// Owns the main-side capture while this PC is main.
+///
+/// Lock order: `state`, then `capture`, then `outgoing`. Every send uses a
+/// sender cloned out under its lock; the channel is unbounded, so sending
+/// never blocks while holding a lock.
+pub struct Role<H: Host> {
+    host: Arc<H>,
+    state: Mutex<State>,
+    capture: Mutex<Option<capture::Handle>>,
+    outgoing: Mutex<Option<Sender<Message>>>,
+    next_peer: AtomicU64,
+    capture_enabled: bool,
+}
+
+struct State {
+    main: Main,
+    server: ServerInfo,
+    local: Vec<Display>,
+    /// Connection the capture belongs to; bumped on every connect so a
+    /// reconnect while remote re-enters cleanly.
+    peer: u64,
+}
+
+impl<H: Host> Role<H> {
+    pub fn new(host: &Arc<H>, capture_enabled: bool) -> Self {
+        let main = host.main_setting();
+        Self {
+            host: Arc::clone(host),
+            state: Mutex::new(State {
+                main,
+                server: ServerInfo::new(Os::Windows, Vec::new()),
+                local: host.displays(),
+                peer: 0,
+            }),
+            capture: Mutex::new(None),
+            outgoing: Mutex::new(None),
+            next_peer: AtomicU64::new(1),
+            capture_enabled,
+        }
+    }
+
+    pub fn get(&self) -> Main {
+        guard(&self.state).main
+    }
+
+    /// The user's choice (tray menu): adopt it, persist it and tell the
+    /// server. Never echoes back what the server sent: [`adopt`] is for that.
+    pub fn request(&self, main: Main) {
+        if !self.adopt(main) {
+            return;
+        }
+        if let Some(tx) = self.outgoing() {
+            let _ = tx.send(Message::SetMain { main });
+        }
+    }
+
+    /// Adopt `main` (from `Welcome` or `SetMain`): persist, restart the
+    /// capture, no echo. Returns whether anything changed. A side that stops
+    /// being main tells the server to release everything via `Leave`.
+    pub fn adopt(&self, main: Main) -> bool {
+        let mut state = guard(&self.state);
+        if state.main == main {
+            return false;
+        }
+        if state.main == Main::Client
+            && let Some(handle) = guard(&self.capture).take()
+        {
+            handle.stop(true);
+        }
+        state.main = main;
+        self.host.set_main_setting(main);
+        self.sync_capture(&state);
+        true
+    }
+
+    /// Connected: `Welcome.main` wins, the writer takes this `outgoing`,
+    /// and the capture (re)starts on a fresh peer id when we are main.
+    pub fn on_connect(&self, outgoing: Sender<Message>, main: Main, server: ServerInfo) {
+        let peer = self.next_peer.fetch_add(1, Ordering::SeqCst);
+        let mut state = guard(&self.state);
+        if let Some(handle) = guard(&self.capture).take() {
+            // A new connection never saw `Enter`: don't `Leave` it, just
+            // stop. (If we are still main the capture restarts below.)
+            handle.stop(false);
+        }
+        if state.main != main {
+            state.main = main;
+            self.host.set_main_setting(main);
+        }
+        state.server = server;
+        state.local = self.host.displays();
+        state.peer = peer;
+        *guard(&self.outgoing) = Some(outgoing);
+        self.sync_capture(&state);
+    }
+
+    /// The session ended: nothing can be sent anymore; park the cursor
+    /// without telling a dead socket.
+    pub fn on_disconnect(&self) {
+        *guard(&self.outgoing) = None;
+        if let Some(handle) = guard(&self.capture).take() {
+            handle.stop(false);
+        }
+    }
+
+    /// The server's displays changed: keep capturing against the new ones.
+    pub fn on_server_displays(&self, displays: Vec<Display>) {
+        self.push_update(|server| server.displays = displays);
+    }
+
+    /// The server rearranged the client's desktop in its own coordinates.
+    pub fn on_arrangement(&self, origin: Point) {
+        self.push_update(|server| server.arrangement = Some(origin));
+    }
+
+    /// Our own displays changed (polled by the writer): same treatment.
+    pub fn on_local_displays(&self, local: Vec<Display>) {
+        let mut state = guard(&self.state);
+        state.local = local.clone();
+        let (server, peer) = (state.server.clone(), state.peer);
+        if let Some(handle) = guard(&self.capture).as_ref() {
+            handle.update(local, server, Some(peer));
+        }
+    }
+
+    fn push_update(&self, update: impl FnOnce(&mut ServerInfo)) {
+        let mut state = guard(&self.state);
+        update(&mut state.server);
+        let (server, local, peer) = (state.server.clone(), state.local.clone(), state.peer);
+        if let Some(handle) = guard(&self.capture).as_ref() {
+            handle.update(local, server, Some(peer));
+        }
+    }
+
+    /// (Re)start the capture when we are main and connected, else make sure
+    /// it is stopped. Callers hold `state`.
+    fn sync_capture(&self, state: &State) {
+        if state.main != Main::Client {
+            return;
+        }
+        let Some(tx) = self.outgoing() else { return };
+        let handle = if self.capture_enabled {
+            capture::start(tx, state.local.clone(), state.server.clone(), state.peer)
+        } else {
+            capture::Handle::noop(tx)
+        };
+        *guard(&self.capture) = Some(handle);
+    }
+
+    fn outgoing(&self) -> Option<Sender<Message>> {
+        guard(&self.outgoing).clone()
+    }
+
+    #[cfg(test)]
+    pub fn is_capturing(&self) -> bool {
+        guard(&self.capture).is_some()
+    }
+
+    #[cfg(test)]
+    pub fn snapshot(&self) -> (Main, ServerInfo) {
+        let state = guard(&self.state);
+        (state.main, state.server.clone())
+    }
+}
+
+fn guard<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Connects forever, reconnecting with backoff. Everything held is released
 /// whenever a session ends, however it ends.
 pub fn run<H: Host, B: Backend + Send + 'static>(
     config: &Config,
     host: Arc<H>,
     injector: SharedInjector<B>,
+    role: &Arc<Role<H>>,
 ) -> ! {
     let mut backoff = Backoff::new(Duration::from_millis(500), Duration::from_secs(30));
     loop {
         let started = Instant::now();
         let mut welcomed = false;
-        match run_session(config, &host, &injector, || welcomed = true) {
+        match run_session(config, &host, &injector, role, || welcomed = true) {
             Ok(()) => {
                 log!("disconnected");
                 host.status("Disconnected, reconnecting…");
@@ -226,6 +404,7 @@ pub fn run_session<H: Host, B: Backend + Send + 'static>(
     config: &Config,
     host: &Arc<H>,
     injector: &SharedInjector<B>,
+    role: &Arc<Role<H>>,
     on_welcome: impl FnOnce(),
 ) -> Result<(), ClientError> {
     let mut on_welcome = Some(on_welcome);
@@ -242,13 +421,14 @@ pub fn run_session<H: Host, B: Backend + Send + 'static>(
             }
         };
         let mut welcomed = false;
-        let result = session(config, host, injector, &tcp, || {
+        let result = session(config, host, injector, role, &tcp, || {
             welcomed = true;
             if let Some(f) = on_welcome.take() {
                 f();
             }
         });
         lock(injector).release_all();
+        role.on_disconnect();
         let _ = tcp.shutdown(Shutdown::Both);
         match result {
             Err(e) if !welcomed => {
@@ -346,6 +526,7 @@ fn session<H: Host, B: Backend + Send + 'static>(
     config: &Config,
     host: &Arc<H>,
     injector: &SharedInjector<B>,
+    role: &Arc<Role<H>>,
     tcp: &TcpStream,
     on_welcome: impl FnOnce(),
 ) -> Result<(), ClientError> {
@@ -379,10 +560,14 @@ fn session<H: Host, B: Backend + Send + 'static>(
         }),
     )?;
 
+    let (tx, rx) = mpsc::channel();
     match read_message(&mut reader)? {
         Message::Welcome {
             protocol_version,
             name,
+            os,
+            displays: server_displays,
+            main,
         } => {
             if protocol_version != PROTOCOL_VERSION {
                 return Err(ClientError::Protocol(format!(
@@ -390,10 +575,12 @@ fn session<H: Host, B: Backend + Send + 'static>(
                 )));
             }
             log!(
-                "connected to {name} ({} display(s) reported)",
+                "connected to {name} ({} display(s) reported), main: {main:?}",
                 displays.len()
             );
             host.status(&format!("Connected to {name}"));
+            // The server's setting is authoritative at connect.
+            role.on_connect(tx.clone(), main, ServerInfo::new(os, server_displays));
         }
         Message::Reject { reason } => return Err(ClientError::Rejected(reason)),
         other => {
@@ -404,53 +591,95 @@ fn session<H: Host, B: Backend + Send + 'static>(
     }
     on_welcome();
 
-    let (tx, rx) = mpsc::channel();
     let writer = {
         let tcp = tcp.try_clone()?;
         let host = Arc::clone(host);
+        let role = Arc::clone(role);
         let config = config.clone();
         thread::Builder::new()
             .name("onemouse-writer".into())
-            .spawn(move || write_loop(writer, &tcp, rx, &*host, &config, generation, displays))?
+            .spawn(move || {
+                write_loop(
+                    writer, &tcp, rx, &*host, &role, &config, generation, displays,
+                )
+            })?
     };
 
-    let result = read_loop(&mut reader, injector, &tx);
+    let result = read_loop(&mut reader, injector, &tx, role);
 
     // Stop the writer: closing the channel ends its loop, shutting the socket
-    // down unblocks a stuck write.
+    // down unblocks a stuck write. Role (and the capture it owns) still hold
+    // clones of the sender, so release them first: otherwise the channel
+    // never disconnects and `join` below hangs forever.
+    role.on_disconnect();
     drop(tx);
     let _ = tcp.shutdown(Shutdown::Both);
     let _ = writer.join();
     result
 }
 
-fn read_loop<B: Backend>(
+fn read_loop<H: Host, B: Backend>(
     stream: &mut impl Read,
     injector: &SharedInjector<B>,
     tx: &Sender<Message>,
+    role: &Role<H>,
 ) -> Result<(), ClientError> {
     let mut session = Session::default();
+    let send = |msg: Message| {
+        tx.send(msg).map_err(|_| {
+            ClientError::Io(io::Error::new(io::ErrorKind::BrokenPipe, "writer stopped"))
+        })
+    };
     loop {
-        let msg = read_message(stream)?;
-        let reply = session.handle(msg, &mut lock(injector))?;
-        if let Some(reply) = reply
-            && tx.send(reply).is_err()
-        {
-            return Err(ClientError::Io(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "writer stopped",
-            )));
+        match read_message(stream)? {
+            Message::Ping(id) => send(Message::Pong(id))?,
+            Message::Pong(_) => {}
+            // The main side sends input; when we are main the server
+            // shouldn't send any. Anything arriving then is a race at the
+            // switch: drop it (releases are already covered by Leave).
+            input @ (Message::Enter { .. }
+            | Message::Leave
+            | Message::MouseMove { .. }
+            | Message::MouseButton { .. }
+            | Message::Scroll { .. }
+            | Message::Key { .. }) => {
+                if role.get() == Main::Client {
+                    log!("ignoring {input:?}: this PC is main");
+                } else {
+                    session.handle(input, &mut lock(injector))?;
+                }
+            }
+            Message::DisplaysChanged { displays } => {
+                log!("server displays changed ({} display(s))", displays.len());
+                role.on_server_displays(displays);
+            }
+            Message::Arrangement { x, y } => {
+                log!("server arrangement: origin ({x}, {y})");
+                role.on_arrangement(Point::new(f64::from(x), f64::from(y)));
+            }
+            Message::SetMain { main } => {
+                log!("main is now {main:?}");
+                // Adopted and persisted, never echoed.
+                role.adopt(main);
+            }
+            Message::Reject { reason } => return Err(ClientError::Rejected(reason)),
+            Message::Hello(_) | Message::Welcome { .. } => {
+                return Err(ClientError::Protocol("unexpected message".into()));
+            }
         }
     }
 }
 
 /// Sends replies, pings and display updates. The only thread writing to the
-/// socket after the handshake.
-fn write_loop<H: Host + ?Sized>(
+/// socket after the handshake. Also keeps the main-side capture on the
+/// current local displays.
+#[allow(clippy::too_many_arguments)] // thread entry: one spawn site, no good grouping
+fn write_loop<H: Host>(
     mut stream: impl Write,
     tcp: &TcpStream,
     rx: mpsc::Receiver<Message>,
     host: &H,
+    role: &Role<H>,
     config: &Config,
     mut generation: u64,
     mut displays: Vec<Display>,
@@ -471,13 +700,9 @@ fn write_loop<H: Host + ?Sized>(
                 let now = host.displays();
                 if now != displays {
                     log!("displays changed ({} display(s))", now.len());
-                    displays = now;
-                    write_message(
-                        &mut stream,
-                        &Message::DisplaysChanged {
-                            displays: displays.clone(),
-                        },
-                    )?;
+                    displays = now.clone();
+                    role.on_local_displays(now.clone());
+                    write_message(&mut stream, &Message::DisplaysChanged { displays: now })?;
                 }
             }
             if ping_due {
@@ -494,7 +719,8 @@ fn write_loop<H: Host + ?Sized>(
     }
 }
 
-/// Applies primary → secondary messages to the injector.
+/// Applies main → remote input messages to the injector. Only fed while we
+/// are remote; role messages (`SetMain`, …) never reach it.
 #[derive(Debug, Default)]
 pub struct Session {
     /// Whether the cursor is on this machine (between `Enter` and `Leave`).
@@ -503,13 +729,13 @@ pub struct Session {
 }
 
 impl Session {
-    /// Returns the reply to send, if any. Injection failures (e.g. UIPI
-    /// blocking input to an elevated window) are logged, not fatal.
+    /// Injection failures (e.g. UIPI blocking input to an elevated window)
+    /// are logged, not fatal.
     pub fn handle<B: Backend>(
         &mut self,
         msg: Message,
         inj: &mut Injector<B>,
-    ) -> Result<Option<Message>, ClientError> {
+    ) -> Result<(), ClientError> {
         let result = match msg {
             Message::Enter { x, y } => {
                 log!("cursor entered at ({x}, {y})");
@@ -539,21 +765,14 @@ impl Session {
                 log!("ignoring {msg:?}: cursor is not on this machine");
                 Ok(())
             }
-            Message::Ping(id) => return Ok(Some(Message::Pong(id))),
-            Message::Pong(_) => Ok(()),
-            Message::DisplaysChanged { .. } => {
-                log!("ignoring DisplaysChanged from the primary");
-                Ok(())
-            }
-            Message::Reject { reason } => return Err(ClientError::Rejected(reason)),
-            Message::Hello(_) | Message::Welcome { .. } => {
-                return Err(ClientError::Protocol(format!("unexpected {msg:?}")));
+            other => {
+                return Err(ClientError::Protocol(format!("unexpected {other:?}")));
             }
         };
         if let Err(e) = result {
             log!("injection failed: {e}");
         }
-        Ok(None)
+        Ok(())
     }
 }
 
@@ -570,6 +789,7 @@ mod tests {
     struct TestHost {
         displays: Mutex<Vec<Display>>,
         generation: AtomicU64,
+        main: Mutex<Main>,
     }
 
     impl Host for TestHost {
@@ -583,6 +803,14 @@ mod tests {
 
         fn display_generation(&self) -> u64 {
             self.generation.load(Ordering::SeqCst)
+        }
+
+        fn main_setting(&self) -> Main {
+            *self.main.lock().unwrap()
+        }
+
+        fn set_main_setting(&self, main: Main) {
+            *self.main.lock().unwrap() = main;
         }
     }
 
@@ -614,6 +842,7 @@ mod tests {
         mac: Mac,
         host: Arc<TestHost>,
         injector: SharedInjector<RecordingBackend>,
+        role: Arc<Role<TestHost>>,
     }
 
     impl Harness {
@@ -647,6 +876,13 @@ mod tests {
             let mut config = Config::new(Some("127.0.0.1".into()), port, security);
             config.ping_interval = Duration::from_secs(60);
             config.poll_interval = Duration::from_millis(10);
+            let host = Arc::new(TestHost {
+                displays: Mutex::new(vec![display(0)]),
+                generation: AtomicU64::new(0),
+                main: Mutex::new(Main::Server),
+            });
+            // Stub capture off-test-platform: transitions still behave.
+            let role = Arc::new(Role::new(&host, false));
             Self {
                 listener,
                 config,
@@ -656,21 +892,20 @@ mod tests {
                     can_pair: false,
                     slot: onemouse_transport::PairingSlot::new(),
                 },
-                host: Arc::new(TestHost {
-                    displays: Mutex::new(vec![display(0)]),
-                    generation: AtomicU64::new(0),
-                }),
+                host,
                 injector: Arc::new(Mutex::new(Injector::new(RecordingBackend::default()))),
+                role,
             }
         }
 
         fn spawn_client(&self) -> thread::JoinHandle<Result<(), ClientError>> {
-            let (config, host, injector) = (
+            let (config, host, injector, role) = (
                 self.config.clone(),
                 Arc::clone(&self.host),
                 Arc::clone(&self.injector),
+                Arc::clone(&self.role),
             );
-            thread::spawn(move || run_session(&config, &host, &injector, || {}))
+            thread::spawn(move || run_session(&config, &host, &injector, &role, || {}))
         }
 
         /// The fake primary accepts and runs the encrypted handshake.
@@ -707,12 +942,31 @@ mod tests {
         }
     }
 
+    fn mac_display() -> Display {
+        Display {
+            id: 2,
+            x: 0,
+            y: 0,
+            width: 1470,
+            height: 956,
+            scale: 1.0,
+            primary: true,
+        }
+    }
+
     fn welcome(primary: &mut SecureStream) {
+        welcome_as(primary, Main::Server);
+    }
+
+    fn welcome_as(primary: &mut SecureStream, main: Main) {
         write_message(
             primary,
             &Message::Welcome {
                 protocol_version: PROTOCOL_VERSION,
                 name: "macbook".into(),
+                os: Os::MacOs,
+                displays: vec![mac_display()],
+                main,
             },
         )
         .unwrap();
@@ -867,10 +1121,121 @@ mod tests {
             &[Message::Welcome {
                 protocol_version: PROTOCOL_VERSION + 1,
                 name: "future".into(),
+                os: Os::MacOs,
+                displays: vec![mac_display()],
+                main: Main::Server,
             }],
         );
         let err = client.join().unwrap().unwrap_err();
         assert!(matches!(err, ClientError::Protocol(_)), "{err:?}");
+    }
+
+    #[test]
+    fn welcome_adopts_main_and_tracks_the_server() {
+        let h = Harness::new();
+        let (mut primary, client) = h.start();
+        welcome_as(&mut primary, Main::Client);
+        // The Pong proves Welcome was adopted (it is handled first).
+        send(&mut primary, &[Message::Ping(1)]);
+        assert_eq!(read_message(&mut primary).unwrap(), Message::Pong(1));
+        assert_eq!(h.role.get(), Main::Client);
+        assert!(h.role.is_capturing());
+        let (main, server) = h.role.snapshot();
+        assert_eq!(main, Main::Client);
+        assert_eq!(server.os, Os::MacOs);
+        assert_eq!(server.displays, vec![mac_display()]);
+        // Persisted for the next start.
+        assert_eq!(h.host.main_setting(), Main::Client);
+        drop(primary);
+        client.join().unwrap().unwrap_err();
+        // Disconnect parks the capture without telling a dead socket.
+        assert!(!h.role.is_capturing());
+    }
+
+    #[test]
+    fn setmain_is_adopted_not_echoed_and_request_sends() {
+        let h = Harness::new();
+        let (mut primary, client) = h.start();
+        welcome(&mut primary);
+        assert_eq!(h.role.get(), Main::Server);
+        // Incoming SetMain: adopted and persisted, never echoed (the Pong
+        // would have an echo in front of it).
+        send(&mut primary, &[Message::SetMain { main: Main::Client }]);
+        send(&mut primary, &[Message::Ping(2)]);
+        assert_eq!(read_message(&mut primary).unwrap(), Message::Pong(2));
+        assert_eq!(h.role.get(), Main::Client);
+        assert_eq!(h.host.main_setting(), Main::Client);
+        assert!(h.role.is_capturing());
+        // The user's own choice goes out: Leave first, then SetMain.
+        h.role.request(Main::Server);
+        assert_eq!(read_message(&mut primary).unwrap(), Message::Leave);
+        assert_eq!(
+            read_message(&mut primary).unwrap(),
+            Message::SetMain { main: Main::Server }
+        );
+        assert!(!h.role.is_capturing());
+        // Repeating the current setting sends nothing.
+        h.role.request(Main::Server);
+        send(&mut primary, &[Message::Ping(3)]);
+        assert_eq!(read_message(&mut primary).unwrap(), Message::Pong(3));
+        drop(primary);
+        client.join().unwrap().unwrap_err();
+    }
+
+    #[test]
+    fn arrangement_and_server_displays_are_tracked() {
+        let h = Harness::new();
+        let (mut primary, client) = h.start();
+        welcome_as(&mut primary, Main::Client);
+        send(
+            &mut primary,
+            &[
+                Message::Arrangement { x: -1470, y: -46 },
+                Message::DisplaysChanged {
+                    displays: vec![mac_display(), mac_display()],
+                },
+                Message::Ping(4),
+            ],
+        );
+        assert_eq!(read_message(&mut primary).unwrap(), Message::Pong(4));
+        let (_, server) = h.role.snapshot();
+        assert_eq!(server.arrangement, Some(Point::new(-1470.0, -46.0)));
+        assert_eq!(server.displays.len(), 2);
+        drop(primary);
+        client.join().unwrap().unwrap_err();
+    }
+
+    #[test]
+    fn input_from_the_server_is_ignored_while_we_are_main() {
+        let h = Harness::new();
+        let (mut primary, client) = h.start();
+        welcome_as(&mut primary, Main::Client);
+        send(
+            &mut primary,
+            &[
+                Message::Enter { x: 1, y: 1 },
+                Message::Key {
+                    code: key::A,
+                    pressed: true,
+                },
+                Message::MouseMove { x: 50, y: 50 },
+                Message::Ping(5),
+            ],
+        );
+        assert_eq!(read_message(&mut primary).unwrap(), Message::Pong(5));
+        assert!(h.events().is_empty());
+        drop(primary);
+        client.join().unwrap().unwrap_err();
+    }
+
+    #[test]
+    fn role_request_offline_persists_without_capturing() {
+        let h = Harness::new();
+        h.role.request(Main::Client);
+        assert_eq!(h.role.get(), Main::Client);
+        assert_eq!(h.host.main_setting(), Main::Client);
+        // Nowhere to send and no server yet: stays stopped.
+        assert!(!h.role.is_capturing());
     }
 
     #[test]
