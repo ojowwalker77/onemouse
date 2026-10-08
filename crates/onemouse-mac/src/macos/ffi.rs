@@ -65,6 +65,13 @@ pub const kCGEventTapDisabledByUserInput: u32 = 0xFFFF_FFFF;
 pub const GESTURE_EVENT_TYPES: [u32; 8] = [18, 19, 20, 29, 30, 31, 32, 34];
 
 // CGEventField
+pub const kCGHIDEventTap: u32 = 0;
+pub const kCGScrollEventUnitPixel: u32 = 0;
+pub const kCGMouseButtonLeft: u32 = 0;
+pub const kCGMouseButtonRight: u32 = 1;
+pub const kCGMouseButtonCenter: u32 = 2;
+
+pub const kCGMouseEventClickState: u32 = 1;
 pub const kCGMouseEventButtonNumber: u32 = 3;
 pub const kCGMouseEventDeltaX: u32 = 4;
 pub const kCGMouseEventDeltaY: u32 = 5;
@@ -134,6 +141,25 @@ unsafe extern "C" {
     pub fn CGEventGetFlags(event: CGEventRef) -> u64;
     pub fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
     pub fn CGEventGetDoubleValueField(event: CGEventRef, field: u32) -> f64;
+    pub fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
+    pub fn CGEventSetFlags(event: CGEventRef, flags: u64);
+    pub fn CGEventSetType(event: CGEventRef, ty: u32);
+    pub fn CGEventCreateMouseEvent(
+        source: CFTypeRef,
+        ty: u32,
+        position: CGPoint,
+        button: u32,
+    ) -> CGEventRef;
+    pub fn CGEventCreateKeyboardEvent(source: CFTypeRef, keycode: u16, down: bool) -> CGEventRef;
+    pub fn CGEventCreateScrollWheelEvent2(
+        source: CFTypeRef,
+        units: u32,
+        wheel_count: u32,
+        wheel1: i32,
+        wheel2: i32,
+        wheel3: i32,
+    ) -> CGEventRef;
+    pub fn CGEventPost(tap: u32, event: CGEventRef);
 
     pub fn CGGetActiveDisplayList(
         max: u32,
@@ -165,6 +191,7 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub static kAXTrustedCheckOptionPrompt: CFStringRef;
     pub fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> u8;
+    pub fn AXIsProcessTrusted() -> u8;
 }
 
 #[link(name = "Carbon", kind = "framework")]

@@ -121,12 +121,23 @@ impl Controller {
     /// the user's arrangement snapped to the current displays, or the
     /// default side.
     pub fn placed(&self, mac: &[Rect], displays: &[Display]) -> Vec<Placed> {
+        self.origin(mac, displays)
+            .map(|origin| layout::place(displays, origin))
+            .unwrap_or_default()
+    }
+
+    /// Where the secondary's block currently sits (see [`placed`](Self::placed)).
+    pub fn origin(&self, mac: &[Rect], displays: &[Display]) -> Option<Point> {
         let size = layout::block_size(displays);
         self.arrangement
             .and_then(|origin| layout::snap(mac, size, origin))
             .or_else(|| layout::default_origin(mac, size, self.side))
-            .map(|origin| layout::place(displays, origin))
-            .unwrap_or_default()
+    }
+
+    /// Brings the cursor home now, telling the peer (`Leave`), for example
+    /// because this side stopped being main. Nothing to do when local.
+    pub fn leave(&mut self) -> Output {
+        self.go_local(None, true)
     }
 
     /// `mac` are the Mac's displays (needed for moves only); `peer` the
@@ -580,6 +591,18 @@ mod tests {
             c.handle(key(key::A, true), MAC, peer(&pc)),
             Output::default()
         );
+    }
+
+    #[test]
+    fn leave_comes_home_only_when_remote() {
+        let displays = pc(1.0);
+        let mut c = Controller::new(Side::Right, None);
+        assert_eq!(c.leave(), Output::default());
+        cross(&mut c, &displays);
+        let out = c.leave();
+        assert_eq!(out.send, [Message::Leave]);
+        assert!(out.went_local.is_some());
+        assert!(!c.is_remote());
     }
 
     #[test]

@@ -1,12 +1,16 @@
-//! macOS glue: a session event tap feeds every input event to the
-//! [`Controller`], swallows the ones that go to the secondary, and hides and
-//! freezes the cursor while it's away.
+//! macOS glue: while this Mac is main, a session event tap feeds every
+//! input event to the [`Controller`], swallows the ones that go to the PC,
+//! and hides and freezes the cursor while it's away. While the PC is main,
+//! everything passes through and [`MacRemote`] applies the PC's input.
 
 // CoreGraphics names, matched on as constants.
 #![allow(non_upper_case_globals)]
 
 mod ffi;
+mod inject;
 mod ui;
+
+pub use inject::MacRemote;
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
@@ -15,8 +19,8 @@ use std::path::PathBuf;
 use std::ptr;
 use std::sync::Arc;
 
-use onemouse_protocol::MouseButton;
 use onemouse_protocol::key;
+use onemouse_protocol::{Display, Main, MouseButton};
 
 use self::ffi::*;
 use crate::config::Config;
@@ -56,6 +60,12 @@ pub fn ensure_permissions() -> bool {
     }
 }
 
+/// Whether both permissions are granted now, without prompting.
+pub fn permissions_granted() -> bool {
+    // SAFETY: no arguments.
+    unsafe { AXIsProcessTrusted() != 0 && CGPreflightListenEventAccess() }
+}
+
 /// The Mac's displays in global points.
 pub fn displays() -> Vec<Rect> {
     let mut ids = [0; 16];
@@ -69,6 +79,35 @@ pub fn displays() -> Vec<Rect> {
         // SAFETY: ids come from CGGetActiveDisplayList.
         .map(|&id| unsafe { CGDisplayBounds(id) })
         .map(|b| Rect::new(b.origin.x, b.origin.y, b.size.width, b.size.height))
+        .collect()
+}
+
+/// The Mac's displays as the PC sees them: global points, `scale` 1.0 (the
+/// PC's layout units are points too), the menu-bar display primary.
+pub fn protocol_displays() -> Vec<Display> {
+    let mut ids = [0; 16];
+    let mut count = 0;
+    // SAFETY: the buffer holds `ids.len()` entries.
+    if unsafe { CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) } != 0 {
+        return Vec::new();
+    }
+    // SAFETY: no arguments.
+    let main = unsafe { CGMainDisplayID() };
+    ids[..count as usize]
+        .iter()
+        .map(|&id| {
+            // SAFETY: ids come from CGGetActiveDisplayList.
+            let b = unsafe { CGDisplayBounds(id) };
+            Display {
+                id,
+                x: b.origin.x.round() as i32,
+                y: b.origin.y.round() as i32,
+                width: b.size.width.round() as u32,
+                height: b.size.height.round() as u32,
+                scale: 1.0,
+                primary: id == main,
+            }
+        })
         .collect()
 }
 
@@ -206,6 +245,12 @@ unsafe extern "C" fn callback(
 }
 
 fn handle(tap: &Tap, input: Input) -> bool {
+    if tap.link.main() == Main::Client {
+        // The PC has the keyboard and mouse: this Mac's own input (and the
+        // PC's, injected) is just local input.
+        come_home(tap);
+        return false;
+    }
     let mac = if matches!(input, Input::Move { .. }) {
         displays()
     } else {
@@ -237,6 +282,39 @@ fn handle(tap: &Tap, input: Input) -> bool {
         set_cursor_away(tap, false);
     }
     out.swallow
+}
+
+/// If the cursor is on the PC, brings it back and tells the PC (`Leave`).
+fn come_home(tap: &Tap) {
+    let out = tap.controller.borrow_mut().leave();
+    if out.send.is_empty() {
+        return;
+    }
+    tap.link.with_peer(|peer| {
+        if let Some(peer) = peer {
+            for msg in out.send {
+                peer.send(msg);
+            }
+        }
+    });
+    if let Some(p) = out.went_local {
+        // SAFETY: plain CoreGraphics call.
+        unsafe { CGWarpMouseCursorPosition(CGPoint { x: p.x, y: p.y }) };
+    }
+    set_cursor_away(tap, false);
+}
+
+/// The user picked where the keyboard and mouse are, from the menu.
+fn choose_main(tap: &Tap, main: Main) {
+    if main == Main::Client {
+        come_home(tap);
+    }
+    if tap.link.set_main(main) {
+        log!(
+            "keyboard and mouse are now on the {}",
+            crate::server::which(main)
+        );
+    }
 }
 
 /// Hides and freezes the cursor (still receiving deltas) or brings it back.

@@ -1,7 +1,8 @@
-//! TCP listener for the secondary: encrypted handshake (pinned keys or
-//! pairing), then `Hello`, heartbeat and display updates. One secondary at a
-//! time; a new connection replaces the old one so a PC that reconnects after
-//! a network blip doesn't wait for the old one to time out.
+//! TCP listener for the PC: encrypted handshake (pinned keys or pairing),
+//! then `Hello`, heartbeat, display and role updates, and the PC's input
+//! when it is main. One PC at a time; a new connection replaces the old one
+//! so a PC that reconnects after a network blip doesn't wait for the old one
+//! to time out.
 //!
 //! Sends never block the caller (the event tap): messages go through a
 //! channel to a writer thread per connection.
@@ -72,6 +73,23 @@ impl std::fmt::Debug for Security {
     }
 }
 
+/// Applies the PC's input while the PC is main. Called on connection
+/// threads.
+pub trait Remote: Send + Sync + std::fmt::Debug {
+    fn input(&self, msg: &Message);
+    /// Let go of everything held: Leave, disconnect, the Mac became main.
+    fn release(&self);
+}
+
+/// For tests and for running without injection.
+#[derive(Debug)]
+pub struct NoRemote;
+
+impl Remote for NoRemote {
+    fn input(&self, _: &Message) {}
+    fn release(&self) {}
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Name sent in the handshake and `Welcome`.
@@ -81,15 +99,7 @@ pub struct Config {
     pub ping_interval: Duration,
     /// Drop the connection when nothing arrives for this long.
     pub silence_timeout: Duration,
-    /// This Mac's OS marker, displays and "keyboard & mouse are on" setting,
-    /// sent in `Welcome` (v3). The server's `main` is authoritative at
-    /// connect; the client adopts it.
-    pub os: Os,
-    pub displays: Vec<Display>,
-    pub main: Main,
-    /// The client's desktop origin in this Mac's coordinates, sent as
-    /// `Arrangement` right after `Welcome` when arranged.
-    pub arrangement: Option<(i32, i32)>,
+    pub remote: Arc<dyn Remote>,
 }
 
 impl Config {
@@ -99,9 +109,28 @@ impl Config {
             security,
             ping_interval: Duration::from_secs(2),
             silence_timeout: Duration::from_secs(6),
-            os: Os::MacOs,
-            displays: Vec::new(),
+            remote: Arc::new(NoRemote),
+        }
+    }
+}
+
+/// What this Mac tells the PC about itself: in `Welcome`, then as it
+/// changes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Local {
+    /// Who has the keyboard and mouse.
+    pub main: Main,
+    /// In points, `scale` 1.0, global coordinates.
+    pub displays: Vec<Display>,
+    /// The PC's desktop origin in this Mac's coordinates, once known.
+    pub arrangement: Option<(i32, i32)>,
+}
+
+impl Default for Local {
+    fn default() -> Self {
+        Self {
             main: Main::Server,
+            displays: Vec::new(),
             arrangement: None,
         }
     }
@@ -132,8 +161,11 @@ impl Peer {
 }
 
 /// Shared between the event tap and the connection threads.
+///
+/// Lock order: `local`, then `peer`.
 #[derive(Debug, Default)]
 pub struct Link {
+    local: Mutex<Local>,
     peer: Mutex<Option<Peer>>,
     next_id: AtomicU64,
 }
@@ -141,6 +173,62 @@ pub struct Link {
 impl Link {
     pub fn new() -> Arc<Self> {
         Arc::default()
+    }
+
+    pub fn with_local(local: Local) -> Arc<Self> {
+        Arc::new(Self {
+            local: Mutex::new(local),
+            ..Self::default()
+        })
+    }
+
+    pub fn main(&self) -> Main {
+        self.local().main
+    }
+
+    /// The user chose who has the keyboard and mouse: tell the PC. Returns
+    /// whether it changed. If the cursor is on the PC, send `Leave` first.
+    pub fn set_main(&self, main: Main) -> bool {
+        self.update(|l| l.main = main, Message::SetMain { main })
+    }
+
+    /// This Mac's displays changed.
+    pub fn set_displays(&self, displays: Vec<Display>) {
+        let msg = Message::DisplaysChanged {
+            displays: displays.clone(),
+        };
+        self.update(|l| l.displays = displays, msg);
+    }
+
+    /// The user (or a display change) moved the PC's desktop.
+    pub fn set_arrangement(&self, (x, y): (i32, i32)) {
+        self.update(
+            |l| l.arrangement = Some((x, y)),
+            Message::Arrangement { x, y },
+        );
+    }
+
+    /// Applies `change`, and sends `msg` to the PC if anything changed.
+    fn update(&self, change: impl FnOnce(&mut Local), msg: Message) -> bool {
+        let mut local = self.local();
+        let before = local.clone();
+        change(&mut local);
+        if *local == before {
+            return false;
+        }
+        if let Some(peer) = self.lock().as_ref() {
+            peer.send(msg);
+        }
+        true
+    }
+
+    /// The PC chose: adopt without echoing. Returns the previous setting.
+    fn adopt_main(&self, main: Main) -> Main {
+        std::mem::replace(&mut self.local().main, main)
+    }
+
+    fn local(&self) -> MutexGuard<'_, Local> {
+        self.local.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Runs `f` with the current peer, holding the lock so the peer can't
@@ -163,14 +251,17 @@ impl Link {
         id
     }
 
-    fn detach(&self, id: u64) {
+    /// Whether `id` was still the current peer.
+    fn detach(&self, id: u64) -> bool {
         let mut peer = self.lock();
-        if peer.as_ref().is_some_and(|p| p.id == id) {
+        let current = peer.as_ref().is_some_and(|p| p.id == id);
+        if current {
             *peer = None;
         }
+        current
     }
 
-    fn set_displays(&self, id: u64, displays: Vec<Display>) {
+    fn set_peer_displays(&self, id: u64, displays: Vec<Display>) {
         if let Some(peer) = self.lock().as_mut().filter(|p| p.id == id) {
             peer.displays = displays;
         }
@@ -294,19 +385,6 @@ fn session(stream: TcpStream, link: &Link, config: &Config) -> Result<String, Se
         )?;
         return Err(SessionError::Protocol(reason));
     }
-    write_message(
-        &mut writer,
-        &Message::Welcome {
-            protocol_version: PROTOCOL_VERSION,
-            name: config.name.clone(),
-            os: config.os,
-            displays: config.displays.clone(),
-            main: config.main,
-        },
-    )?;
-    if let Some((x, y)) = config.arrangement {
-        write_message(&mut writer, &Message::Arrangement { x, y })?;
-    }
 
     // The name the PC proved with its key, not whatever `Hello` claims.
     let name = who.name;
@@ -316,14 +394,39 @@ fn session(stream: TcpStream, link: &Link, config: &Config) -> Result<String, Se
         describe(&hello.displays)
     );
     let (tx, rx) = mpsc::channel();
-    let id = link.attach(Peer {
-        name: name.clone(),
-        addr,
-        displays: hello.displays,
-        id: 0,
-        tx: tx.clone(),
-        stream: tcp.try_clone()?,
-    });
+    // Snapshot and attach together: later changes queue behind `Welcome`.
+    let (welcome, id) = {
+        let local = link.local();
+        let id = link.attach(Peer {
+            name: name.clone(),
+            addr,
+            displays: hello.displays,
+            id: 0,
+            tx: tx.clone(),
+            stream: tcp.try_clone()?,
+        });
+        (local.clone(), id)
+    };
+    let sent = (|| {
+        write_message(
+            &mut writer,
+            &Message::Welcome {
+                protocol_version: PROTOCOL_VERSION,
+                name: config.name.clone(),
+                os: Os::MacOs,
+                displays: welcome.displays,
+                main: welcome.main,
+            },
+        )?;
+        if let Some((x, y)) = welcome.arrangement {
+            write_message(&mut writer, &Message::Arrangement { x, y })?;
+        }
+        Ok::<_, FrameError>(())
+    })();
+    if let Err(e) = sent {
+        link.detach(id);
+        return Err(e.into());
+    }
     let ping_interval = config.ping_interval;
     let shutdown = tcp.try_clone()?;
     let writer_thread = thread::spawn(move || write_loop(writer, shutdown, rx, ping_interval));
@@ -332,12 +435,32 @@ fn session(stream: TcpStream, link: &Link, config: &Config) -> Result<String, Se
         match read_message(&mut reader) {
             Ok(Message::DisplaysChanged { displays }) => {
                 log!("{name} displays changed: {}", describe(&displays));
-                link.set_displays(id, displays);
+                link.set_peer_displays(id, displays);
             }
             Ok(Message::Ping(n)) => {
                 let _ = tx.send(Message::Pong(n));
             }
             Ok(Message::Pong(_)) => {}
+            Ok(Message::SetMain { main }) => {
+                log!("{name}: keyboard and mouse are now on the {}", which(main));
+                if link.adopt_main(main) == Main::Client && main == Main::Server {
+                    config.remote.release();
+                }
+            }
+            Ok(
+                input @ (Message::Enter { .. }
+                | Message::Leave
+                | Message::MouseMove { .. }
+                | Message::MouseButton { .. }
+                | Message::Scroll { .. }
+                | Message::Key { .. }),
+            ) => {
+                // Only the main side sends input; anything else is a race
+                // at the switch (and the release is covered).
+                if link.main() == Main::Client {
+                    config.remote.input(&input);
+                }
+            }
             Ok(Message::Reject { reason }) => {
                 break Err(SessionError::Protocol(format!("rejected: {reason}")));
             }
@@ -346,7 +469,9 @@ fn session(stream: TcpStream, link: &Link, config: &Config) -> Result<String, Se
         }
     };
 
-    link.detach(id);
+    if link.detach(id) {
+        config.remote.release();
+    }
     drop(tx);
     let _ = tcp.shutdown(Shutdown::Both);
     let _ = writer_thread.join();
@@ -380,6 +505,14 @@ fn write_loop(
             let _ = tcp.shutdown(Shutdown::Both);
             return;
         }
+    }
+}
+
+/// "Mac" or "PC", for logs.
+pub fn which(main: Main) -> &'static str {
+    match main {
+        Main::Server => "Mac",
+        Main::Client => "PC",
     }
 }
 
@@ -484,11 +617,49 @@ mod tests {
     }
 
     fn start(config: Config) -> (Arc<Link>, u16) {
+        start_with(config, Link::new())
+    }
+
+    fn start_with(config: Config, link: Arc<Link>) -> (Arc<Link>, u16) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let link = Link::new();
         serve(listener, Arc::clone(&link), config);
         (link, port)
+    }
+
+    /// Records what the PC's input would do on this Mac.
+    #[derive(Debug, Default)]
+    struct Recorder(Mutex<Vec<Option<Message>>>);
+
+    impl Remote for Recorder {
+        fn input(&self, msg: &Message) {
+            self.0.lock().unwrap().push(Some(msg.clone()));
+        }
+        fn release(&self) {
+            self.0.lock().unwrap().push(None);
+        }
+    }
+
+    impl Recorder {
+        fn take(&self) -> Vec<Option<Message>> {
+            std::mem::take(&mut self.0.lock().unwrap())
+        }
+    }
+
+    /// Reads past pings.
+    fn next(s: &mut SecureStream) -> Message {
+        loop {
+            match read_message(s).unwrap() {
+                Message::Ping(_) => {}
+                other => return other,
+            }
+        }
+    }
+
+    /// Ping/Pong round trip: everything sent before it was handled.
+    fn sync(s: &mut SecureStream) {
+        write_message(s, &Message::Ping(99)).unwrap();
+        assert_eq!(next(s), Message::Pong(99));
     }
 
     /// A paired PC and the Mac it trusts, listening.
@@ -546,6 +717,100 @@ mod tests {
 
         drop(s);
         eventually(|| peer_displays(&link).is_none());
+    }
+
+    #[test]
+    fn welcome_describes_the_mac_and_changes_follow() {
+        let pc = Pc::new();
+        let security = security(&pc.identity);
+        let pc = pc.trusting(&security);
+        let mac = Display {
+            scale: 1.0,
+            ..display(0)
+        };
+        let link = Link::with_local(Local {
+            main: Main::Client,
+            displays: vec![mac.clone()],
+            arrangement: Some((1470, -20)),
+        });
+        let (link, port) = start_with(Config::new("mac", security), link);
+        let mut s = pc.connect(port, false).unwrap();
+        assert_eq!(
+            next(&mut s),
+            Message::Welcome {
+                protocol_version: PROTOCOL_VERSION,
+                name: "mac".into(),
+                os: Os::MacOs,
+                displays: vec![mac.clone()],
+                main: Main::Client,
+            }
+        );
+        assert_eq!(next(&mut s), Message::Arrangement { x: 1470, y: -20 });
+        eventually(|| peer_displays(&link).is_some());
+
+        // Unchanged values aren't resent.
+        link.set_arrangement((1470, -20));
+        link.set_displays(vec![mac.clone()]);
+        assert!(!link.set_main(Main::Client));
+        link.set_arrangement((-1920, 0));
+        link.set_displays(vec![]);
+        assert!(link.set_main(Main::Server));
+        assert_eq!(next(&mut s), Message::Arrangement { x: -1920, y: 0 });
+        assert_eq!(next(&mut s), Message::DisplaysChanged { displays: vec![] });
+        assert_eq!(next(&mut s), Message::SetMain { main: Main::Server });
+    }
+
+    #[test]
+    fn pc_input_is_applied_only_while_the_pc_is_main() {
+        let pc = Pc::new();
+        let security = security(&pc.identity);
+        let pc = pc.trusting(&security);
+        let recorder = Arc::new(Recorder::default());
+        let mut config = Config::new("mac", security);
+        config.remote = recorder.clone();
+        let (link, port) = start(config);
+        let mut s = pc.connect(port, false).unwrap();
+        next(&mut s);
+
+        // The Mac is main: the PC's input is a stale race, dropped.
+        write_message(&mut s, &Message::MouseMove { x: 1, y: 1 }).unwrap();
+        sync(&mut s);
+        assert_eq!(recorder.take(), []);
+
+        // The PC takes over: adopted, not echoed.
+        write_message(&mut s, &Message::SetMain { main: Main::Client }).unwrap();
+        write_message(&mut s, &Message::Enter { x: 5, y: 6 }).unwrap();
+        write_message(
+            &mut s,
+            &Message::Key {
+                code: onemouse_protocol::key::A,
+                pressed: true,
+            },
+        )
+        .unwrap();
+        sync(&mut s);
+        assert_eq!(link.main(), Main::Client);
+        assert_eq!(
+            recorder.take(),
+            [
+                Some(Message::Enter { x: 5, y: 6 }),
+                Some(Message::Key {
+                    code: onemouse_protocol::key::A,
+                    pressed: true
+                }),
+            ]
+        );
+
+        // Handing it back releases whatever the PC held here.
+        write_message(&mut s, &Message::SetMain { main: Main::Server }).unwrap();
+        sync(&mut s);
+        assert_eq!(link.main(), Main::Server);
+        assert_eq!(recorder.take(), [None]);
+
+        // So does disconnecting.
+        drop(s);
+        eventually(|| peer_displays(&link).is_none());
+        assert_eq!(recorder.take(), [None]);
     }
 
     #[test]
