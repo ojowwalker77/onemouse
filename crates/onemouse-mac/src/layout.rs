@@ -1,8 +1,10 @@
-//! Screen geometry: when the cursor leaves the Mac, where it lands on the
-//! secondary, how it moves there, and where it comes back.
+//! Screen geometry. The secondary's displays are placed in the Mac's global
+//! coordinate space (points, origin top-left of the main display, y down) as
+//! one block, the way System Settings → Displays arranges monitors. The
+//! cursor crosses wherever the two touch.
 //!
-//! Mac rects are in global display points (origin top-left of the main
-//! display, y down). Secondary rects are in its virtual desktop pixels.
+//! The block's top-left corner is the *arrangement origin*. It is always
+//! snapped so the block touches a Mac display without overlapping any.
 
 use onemouse_protocol::Display;
 
@@ -15,6 +17,10 @@ pub struct Point {
 impl Point {
     pub const fn new(x: f64, y: f64) -> Self {
         Self { x, y }
+    }
+
+    fn distance_sq(self, other: Point) -> f64 {
+        (self.x - other.x).powi(2) + (self.y - other.y).powi(2)
     }
 }
 
@@ -52,6 +58,14 @@ impl Rect {
         p.x >= self.x && p.x < self.max_x() && p.y >= self.y && p.y < self.max_y()
     }
 
+    /// Whether the two share any area (touching edges don't count).
+    pub fn overlaps(&self, other: &Rect) -> bool {
+        self.x < other.max_x()
+            && other.x < self.max_x()
+            && self.y < other.max_y()
+            && other.y < self.max_y()
+    }
+
     /// Nearest point inside, keeping a whole pixel/point from the far edges.
     pub fn clamp(&self, p: Point) -> Point {
         Point::new(
@@ -61,12 +75,24 @@ impl Rect {
     }
 
     fn distance_sq(&self, p: Point) -> f64 {
-        let c = self.clamp(p);
-        (c.x - p.x).powi(2) + (c.y - p.y).powi(2)
+        self.clamp(p).distance_sq(p)
+    }
+
+    /// Smallest rect containing all of `rects`.
+    pub fn union(rects: impl IntoIterator<Item = Rect>) -> Option<Rect> {
+        rects.into_iter().reduce(|a, b| {
+            let (x, y) = (a.x.min(b.x), a.y.min(b.y));
+            Rect::new(
+                x,
+                y,
+                a.max_x().max(b.max_x()) - x,
+                a.max_y().max(b.max_y()) - y,
+            )
+        })
     }
 }
 
-/// Which side of the Mac the secondary sits on.
+/// Which side of the Mac the secondary starts on before the user arranges it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
     Left,
@@ -85,130 +111,218 @@ impl Side {
             _ => None,
         }
     }
+}
 
-    /// Unit vector pointing from the Mac towards the secondary.
-    fn dir(self) -> (f64, f64) {
-        match self {
-            Self::Left => (-1.0, 0.0),
-            Self::Right => (1.0, 0.0),
-            Self::Top => (0.0, -1.0),
-            Self::Bottom => (0.0, 1.0),
+/// One secondary display placed in Mac points.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Placed {
+    pub display: Display,
+    /// Where it sits in Mac global points.
+    pub rect: Rect,
+}
+
+impl Placed {
+    /// Its own virtual-desktop pixels.
+    pub fn pixels(&self) -> Rect {
+        Rect::from_display(&self.display)
+    }
+
+    /// Pixels per Mac point.
+    pub fn scale(&self) -> f64 {
+        f64::from(self.display.width) / self.rect.width
+    }
+
+    pub fn to_pixels(&self, p: Point) -> Point {
+        let px = self.pixels();
+        let s = self.scale();
+        Point::new(
+            px.x + (p.x - self.rect.x) * s,
+            px.y + (p.y - self.rect.y) * s,
+        )
+    }
+
+    pub fn to_points(&self, p: Point) -> Point {
+        let px = self.pixels();
+        let s = self.scale();
+        Point::new(
+            self.rect.x + (p.x - px.x) / s,
+            self.rect.y + (p.y - px.y) / s,
+        )
+    }
+}
+
+/// Places the secondary's displays with the block's top-left at `origin`.
+/// Each display is as big in points as it looks (pixels ÷ its scale);
+/// offsets between displays use the primary display's scale.
+pub fn place(displays: &[Display], origin: Point) -> Vec<Placed> {
+    let reference = displays
+        .iter()
+        .find(|d| d.primary)
+        .or(displays.first())
+        .map_or(1.0, scale_of);
+    let left = displays.iter().map(|d| d.x).min().unwrap_or(0);
+    let top = displays.iter().map(|d| d.y).min().unwrap_or(0);
+    displays
+        .iter()
+        .map(|d| Placed {
+            display: d.clone(),
+            rect: Rect::new(
+                origin.x + f64::from(d.x - left) / reference,
+                origin.y + f64::from(d.y - top) / reference,
+                f64::from(d.width) / scale_of(d),
+                f64::from(d.height) / scale_of(d),
+            ),
+        })
+        .collect()
+}
+
+fn scale_of(d: &Display) -> f64 {
+    if d.scale > 0.0 { d.scale.into() } else { 1.0 }
+}
+
+/// Size of the secondary's block in Mac points.
+pub fn block_size(displays: &[Display]) -> (f64, f64) {
+    Rect::union(place(displays, Point::new(0.0, 0.0)).iter().map(|p| p.rect))
+        .map_or((0.0, 0.0), |r| (r.width, r.height))
+}
+
+/// Shortest shared edge between the Mac and the secondary, in points, so
+/// there's always room to cross.
+pub const MIN_SHARED_EDGE: f64 = 40.0;
+
+/// The valid origin nearest `desired`: the block touches a Mac display edge
+/// (sharing at least [`MIN_SHARED_EDGE`]) without overlapping any.
+pub fn snap(mac: &[Rect], (w, h): (f64, f64), desired: Point) -> Option<Point> {
+    // Like `clamp`, but a range narrower than the shared edge centers.
+    let fit = |v: f64, lo: f64, hi: f64| {
+        if lo <= hi {
+            v.clamp(lo, hi)
+        } else {
+            (lo + hi) / 2.0
         }
-    }
-
-    fn outward(self, dx: f64, dy: f64) -> bool {
-        let (ux, uy) = self.dir();
-        dx * ux + dy * uy > 0.0
-    }
-
-    /// Position of `p` along the shared edge of `r`, from 0 to 1.
-    fn along(self, r: &Rect, p: Point) -> f64 {
-        let t = match self {
-            Self::Left | Self::Right => (p.y - r.y) / r.height,
-            Self::Top | Self::Bottom => (p.x - r.x) / r.width,
-        };
-        t.clamp(0.0, 1.0)
-    }
-
-    /// Point `inset` units inside `r`'s edge that faces `towards`, at `t`.
-    fn on_edge(self, towards: (f64, f64), r: &Rect, t: f64, inset: f64) -> Point {
-        let p = match self {
-            Self::Left | Self::Right => {
-                let x = if towards.0 > 0.0 {
-                    r.max_x() - 1.0 - inset
-                } else {
-                    r.x + inset
-                };
-                Point::new(x, r.y + t * r.height)
-            }
-            Self::Top | Self::Bottom => {
-                let y = if towards.1 > 0.0 {
-                    r.max_y() - 1.0 - inset
-                } else {
-                    r.y + inset
-                };
-                Point::new(r.x + t * r.width, y)
-            }
-        };
-        r.clamp(p)
-    }
-}
-
-/// The cursor is pushing against a free Mac edge facing the secondary.
-/// Returns the Mac display it is leaving and the position along its edge.
-pub fn crossing(side: Side, mac: &[Rect], pos: Point, dx: f64, dy: f64) -> Option<(Rect, f64)> {
-    if !side.outward(dx, dy) {
-        return None;
-    }
-    let display = mac.iter().find(|r| r.contains(pos))?;
-    let (ux, uy) = side.dir();
-    let beyond = Point::new(pos.x + ux, pos.y + uy);
-    if mac.iter().any(|r| r.contains(beyond)) {
-        return None;
-    }
-    Some((*display, side.along(display, pos)))
-}
-
-/// Where the cursor lands on the secondary: on the display edge facing the
-/// Mac, at the same relative position it left the Mac's edge.
-pub fn entry_point(side: Side, secondary: &[Rect], t: f64) -> Option<Point> {
-    let key = |r: &Rect| match side {
-        Side::Right => r.x,
-        Side::Left => -r.max_x(),
-        Side::Bottom => r.y,
-        Side::Top => -r.max_y(),
     };
-    let facing = secondary.iter().min_by(|a, b| key(a).total_cmp(&key(b)))?;
-    let (ux, uy) = side.dir();
-    Some(side.on_edge((-ux, -uy), facing, t, 0.0))
+    mac.iter()
+        .flat_map(|r| {
+            let y = fit(
+                desired.y,
+                r.y - h + MIN_SHARED_EDGE,
+                r.max_y() - MIN_SHARED_EDGE,
+            );
+            let x = fit(
+                desired.x,
+                r.x - w + MIN_SHARED_EDGE,
+                r.max_x() - MIN_SHARED_EDGE,
+            );
+            [
+                Point::new(r.max_x(), y),
+                Point::new(r.x - w, y),
+                Point::new(x, r.max_y()),
+                Point::new(x, r.y - h),
+            ]
+        })
+        .filter(|p| {
+            let block = Rect::new(p.x, p.y, w, h);
+            !mac.iter().any(|r| r.overlaps(&block))
+        })
+        .min_by(|a, b| a.distance_sq(desired).total_cmp(&b.distance_sq(desired)))
 }
 
-/// Where the cursor reappears on the Mac display it left from.
-pub fn return_point(side: Side, mac_display: &Rect, t: f64) -> Point {
-    side.on_edge(side.dir(), mac_display, t, 1.0)
+/// Initial origin before the user arranges anything: centered on `side` of
+/// the main display.
+pub fn default_origin(mac: &[Rect], (w, h): (f64, f64), side: Side) -> Option<Point> {
+    let main = mac
+        .iter()
+        .find(|r| r.contains(Point::new(0.0, 0.0)))
+        .or(mac.first())?;
+    let mid_x = main.x + (main.width - w) / 2.0;
+    let mid_y = main.y + (main.height - h) / 2.0;
+    let desired = match side {
+        Side::Right => Point::new(main.max_x(), mid_y),
+        Side::Left => Point::new(main.x - w, mid_y),
+        Side::Bottom => Point::new(mid_x, main.max_y()),
+        Side::Top => Point::new(mid_x, main.y - h),
+    };
+    snap(mac, (w, h), desired)
+}
+
+/// Rounds a delta away from zero to at least one unit, so pushing against
+/// an edge always probes past it.
+fn probe(d: f64) -> f64 {
+    if d > 0.0 {
+        d.max(1.0)
+    } else if d < 0.0 {
+        d.min(-1.0)
+    } else {
+        0.0
+    }
+}
+
+/// The Mac cursor at `pos` moves by (`dx`, `dy`) points. If that pushes it
+/// off the Mac and onto the secondary, returns the display index and the
+/// pixel it lands on.
+pub fn crossing(
+    mac: &[Rect],
+    secondary: &[Placed],
+    pos: Point,
+    dx: f64,
+    dy: f64,
+) -> Option<(usize, Point)> {
+    let (dx, dy) = (probe(dx), probe(dy));
+    let diagonal = Point::new(pos.x + dx, pos.y + dy);
+    if mac.iter().any(|r| r.contains(diagonal)) {
+        return None;
+    }
+    // Also try each axis alone, so a diagonal push slides along the edge.
+    [
+        diagonal,
+        Point::new(pos.x + dx, pos.y),
+        Point::new(pos.x, pos.y + dy),
+    ]
+    .into_iter()
+    .filter(|p| *p != pos && !mac.iter().any(|r| r.contains(*p)))
+    .find_map(|p| {
+        let i = secondary.iter().position(|s| s.rect.contains(p))?;
+        let s = &secondary[i];
+        Some((i, s.pixels().clamp(s.to_pixels(p))))
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Step {
-    /// New cursor position on the secondary.
+    /// New cursor position on the secondary, in its pixels.
     Stay(Point),
-    /// The cursor crossed back to the Mac at this position along the edge.
-    Leave(f64),
+    /// The cursor went back onto the Mac, at this point.
+    Leave(Point),
 }
 
 /// Moves the cursor on the secondary by (`dx`, `dy`) pixels. It never lands
-/// outside a display; pushing out through a free edge facing the Mac leaves.
-pub fn move_on_secondary(side: Side, secondary: &[Rect], pos: Point, dx: f64, dy: f64) -> Step {
-    let Some(current) = secondary
-        .iter()
-        .min_by(|a, b| a.distance_sq(pos).total_cmp(&b.distance_sq(pos)))
-    else {
-        return Step::Leave(0.5);
+/// outside a display; pushing out where the Mac touches leaves.
+pub fn move_on_secondary(mac: &[Rect], secondary: &[Placed], pos: Point, dx: f64, dy: f64) -> Step {
+    let Some(current) = secondary.iter().min_by(|a, b| {
+        a.pixels()
+            .distance_sq(pos)
+            .total_cmp(&b.pixels().distance_sq(pos))
+    }) else {
+        return Step::Stay(pos);
     };
     let target = Point::new(pos.x + dx, pos.y + dy);
-    if secondary.iter().any(|r| r.contains(target)) {
+    if secondary.iter().any(|s| s.pixels().contains(target)) {
         return Step::Stay(target);
     }
-
-    let clamped = current.clamp(target);
-    let (ux, uy) = side.dir();
-    let exits_towards_mac = match side {
-        Side::Right => target.x < current.x,
-        Side::Left => target.x >= current.max_x(),
-        Side::Bottom => target.y < current.y,
-        Side::Top => target.y >= current.max_y(),
-    };
-    if exits_towards_mac && side.outward(-dx, -dy) {
-        let edge = side.on_edge((-ux, -uy), current, side.along(current, clamped), 0.0);
-        let beyond = Point::new(edge.x - ux, edge.y - uy);
-        if !secondary.iter().any(|r| r.contains(beyond)) {
-            return Step::Leave(side.along(current, clamped));
+    for p in [
+        target,
+        Point::new(target.x, pos.y),
+        Point::new(pos.x, target.y),
+    ] {
+        let on_mac = current.to_points(p);
+        if let Some(r) = mac.iter().find(|r| r.contains(on_mac)) {
+            return Step::Leave(r.clamp(on_mac));
         }
     }
-    Step::Stay(clamped)
+    Step::Stay(current.pixels().clamp(target))
 }
 
-/// The secondary display under `pos`, or the nearest one.
+/// The secondary display under `pos` (pixels), or the nearest one.
 pub fn display_at(secondary: &[Display], pos: Point) -> Option<&Display> {
     secondary.iter().min_by(|a, b| {
         Rect::from_display(a)
@@ -221,129 +335,151 @@ pub fn display_at(secondary: &[Display], pos: Point) -> Option<&Display> {
 mod tests {
     use super::*;
 
-    // An LG 1920x1080 above a 1280x832 MacBook Air screen.
-    const LG: Rect = Rect::new(-320.0, -1080.0, 1920.0, 1080.0);
-    const AIR: Rect = Rect::new(0.0, 0.0, 1280.0, 832.0);
+    // An LG 1920x1080 above a 1470x956 MacBook Air screen.
+    const AIR: Rect = Rect::new(0.0, 0.0, 1470.0, 956.0);
+    const LG: Rect = Rect::new(-223.0, -1080.0, 1920.0, 1080.0);
     const MAC: &[Rect] = &[AIR, LG];
-    const PC: &[Rect] = &[Rect::new(0.0, 0.0, 1920.0, 1080.0)];
+
+    fn display(x: i32, y: i32, width: u32, height: u32, scale: f32, primary: bool) -> Display {
+        Display {
+            id: 1,
+            x,
+            y,
+            width,
+            height,
+            scale,
+            primary,
+        }
+    }
+
+    fn pc() -> Vec<Display> {
+        vec![display(0, 0, 1920, 1080, 1.25, true)]
+    }
 
     #[test]
-    fn crosses_only_at_a_free_edge_pushing_outward() {
-        let at_right = Point::new(1279.0, 416.0);
+    fn places_displays_at_their_visual_size() {
+        let two = [
+            display(0, 0, 1920, 1080, 1.25, true),
+            display(-2560, 0, 2560, 1440, 2.0, false),
+        ];
+        let placed = place(&two, Point::new(100.0, 50.0));
+        // The left monitor's 2560 px at the primary's 1.25 → 2048 pt offset.
+        assert_eq!(placed[1].rect, Rect::new(100.0, 50.0, 1280.0, 720.0));
+        assert_eq!(placed[0].rect, Rect::new(2148.0, 50.0, 1536.0, 864.0));
+        assert_eq!(block_size(&two), (3584.0, 864.0));
+
+        let p = &placed[0];
+        let px = p.to_pixels(Point::new(2158.0, 58.0));
+        assert_eq!(px, Point::new(12.5, 10.0));
+        assert_eq!(p.to_points(px), Point::new(2158.0, 58.0));
+    }
+
+    #[test]
+    fn snaps_to_the_nearest_touching_edge_without_overlap() {
+        let size = (1536.0, 864.0);
+        // Dropped overlapping the Air's right half → pushed out to the right.
         assert_eq!(
-            crossing(Side::Right, MAC, at_right, 5.0, 0.0),
-            Some((AIR, 0.5))
+            snap(MAC, size, Point::new(1000.0, 50.0)),
+            Some(Point::new(1470.0, 50.0))
         );
-        assert_eq!(crossing(Side::Right, MAC, at_right, -5.0, 0.0), None);
-        assert_eq!(crossing(Side::Right, MAC, at_right, 0.0, 5.0), None);
+        // Dragged far down-right → hangs off the Air keeping 40 pt shared.
         assert_eq!(
-            crossing(Side::Right, MAC, Point::new(1200.0, 416.0), 5.0, 0.0),
+            snap(MAC, size, Point::new(3000.0, 2000.0)),
+            Some(Point::new(1470.0, 916.0))
+        );
+        // Right of the LG, above the Air's level.
+        assert_eq!(
+            snap(MAC, size, Point::new(1800.0, -900.0)),
+            Some(Point::new(1697.0, -900.0))
+        );
+        assert_eq!(snap(&[], size, Point::new(0.0, 0.0)), None);
+    }
+
+    #[test]
+    fn default_origin_centers_on_the_main_display_side() {
+        let size = block_size(&pc());
+        assert_eq!(
+            default_origin(MAC, size, Side::Right),
+            Some(Point::new(1470.0, 46.0))
+        );
+        assert_eq!(
+            default_origin(MAC, size, Side::Bottom),
+            Some(Point::new(-33.0, 956.0))
+        );
+        // The Air's top is taken by the LG, so it lands on the LG's top.
+        assert_eq!(
+            default_origin(MAC, size, Side::Top),
+            Some(Point::new(-33.0, -1944.0))
+        );
+    }
+
+    #[test]
+    fn crosses_where_the_secondary_touches() {
+        let pc = place(&pc(), Point::new(1470.0, 46.0));
+        let at = Point::new(1469.0, 446.0);
+        assert_eq!(
+            crossing(MAC, &pc, at, 3.0, 0.0),
+            Some((0, Point::new(2.5, 500.0)))
+        );
+        // Sub-point pushes still probe past the edge.
+        assert_eq!(
+            crossing(MAC, &pc, at, 0.2, 0.0),
+            Some((0, Point::new(0.0, 500.0)))
+        );
+        // A diagonal push slides into the PC.
+        assert!(crossing(MAC, &pc, at, 2.0, 2.0).is_some());
+        // Not pushing outward, or still room on the Mac.
+        assert_eq!(crossing(MAC, &pc, at, -3.0, 0.0), None);
+        assert_eq!(
+            crossing(MAC, &pc, Point::new(1400.0, 446.0), 3.0, 0.0),
             None
         );
-        // The LG's right edge is free too.
-        assert_eq!(
-            crossing(Side::Right, MAC, Point::new(1599.0, -540.0), 1.0, 0.0),
-            Some((LG, 0.5))
-        );
+        // The Air's right edge above the PC's top: nothing there.
+        assert_eq!(crossing(MAC, &pc, Point::new(1469.0, 10.0), 3.0, 0.0), None);
     }
 
     #[test]
-    fn edges_shared_between_mac_displays_never_cross() {
-        // Top of the Air touches the LG.
+    fn moves_clamps_and_leaves_where_the_mac_touches() {
+        let pc = place(&pc(), Point::new(1470.0, 46.0));
+        let at = Point::new;
         assert_eq!(
-            crossing(Side::Top, MAC, Point::new(640.0, 0.0), 0.0, -3.0),
-            None
+            move_on_secondary(MAC, &pc, at(100.0, 100.0), 10.0, -5.0),
+            Step::Stay(at(110.0, 95.0))
         );
-        // Top of the LG is free.
+        // Top, right and bottom edges clamp.
         assert_eq!(
-            crossing(Side::Top, MAC, Point::new(640.0, -1080.0), 0.0, -3.0),
-            Some((LG, 0.5))
+            move_on_secondary(MAC, &pc, at(1915.0, 5.0), 50.0, -50.0),
+            Step::Stay(at(1919.0, 0.0))
         );
-        // Bottom of the Air is free.
-        assert!(crossing(Side::Bottom, MAC, Point::new(0.0, 831.0), 0.0, 1.0).is_some());
+        // Left edge where the Air is → back on the Mac at the same height.
+        assert_eq!(
+            move_on_secondary(MAC, &pc, at(0.0, 500.0), -2.5, 0.0),
+            Step::Leave(at(1468.0, 446.0))
+        );
+
+        // PC placed low: its left edge below the Air's bottom clamps…
+        let low = place(&[display(0, 0, 1920, 1080, 1.0, true)], at(1470.0, 900.0));
+        assert_eq!(
+            move_on_secondary(MAC, &low, at(0.0, 500.0), -5.0, 0.0),
+            Step::Stay(at(0.0, 500.0))
+        );
+        // …and only the part next to the Air leaves.
+        assert!(matches!(
+            move_on_secondary(MAC, &low, at(0.0, 20.0), -5.0, 0.0),
+            Step::Leave(_)
+        ));
     }
 
     #[test]
-    fn enters_on_the_facing_display_edge() {
-        let pcs = [
-            Rect::new(-1920.0, 0.0, 1920.0, 1080.0),
-            Rect::new(0.0, 0.0, 2560.0, 1440.0),
+    fn walks_between_secondary_displays() {
+        let two = [
+            display(0, 0, 1920, 1080, 1.0, true),
+            display(1920, 0, 1920, 1080, 1.0, false),
         ];
+        let pc = place(&two, Point::new(1470.0, 0.0));
         assert_eq!(
-            entry_point(Side::Right, &pcs, 0.5),
-            Some(Point::new(-1920.0, 540.0))
-        );
-        assert_eq!(
-            entry_point(Side::Left, &pcs, 0.0),
-            Some(Point::new(2559.0, 0.0))
-        );
-        assert_eq!(
-            entry_point(Side::Bottom, PC, 1.0),
-            Some(Point::new(1919.0, 0.0))
-        );
-        assert_eq!(
-            entry_point(Side::Top, PC, 0.25),
-            Some(Point::new(480.0, 1079.0))
-        );
-        assert_eq!(entry_point(Side::Right, &[], 0.5), None);
-    }
-
-    #[test]
-    fn moves_and_clamps_inside_the_secondary() {
-        let start = Point::new(100.0, 100.0);
-        assert_eq!(
-            move_on_secondary(Side::Right, PC, start, 10.0, -5.0),
-            Step::Stay(Point::new(110.0, 95.0))
-        );
-        // Far edge and top/bottom clamp instead of leaving.
-        assert_eq!(
-            move_on_secondary(Side::Right, PC, Point::new(1915.0, 5.0), 50.0, -50.0),
-            Step::Stay(Point::new(1919.0, 0.0))
-        );
-    }
-
-    #[test]
-    fn leaves_through_the_edge_facing_the_mac() {
-        assert_eq!(
-            move_on_secondary(Side::Right, PC, Point::new(2.0, 270.0), -5.0, 0.0),
-            Step::Leave(0.25)
-        );
-        assert_eq!(
-            move_on_secondary(Side::Bottom, PC, Point::new(960.0, 1.0), 0.0, -4.0),
-            Step::Leave(0.5)
-        );
-        assert_eq!(
-            move_on_secondary(Side::Left, PC, Point::new(1918.0, 0.0), 3.0, 0.0),
-            Step::Leave(0.0)
-        );
-    }
-
-    #[test]
-    fn walks_between_secondary_displays_without_leaving() {
-        let pcs = [
-            Rect::new(0.0, 0.0, 1920.0, 1080.0),
-            Rect::new(-1920.0, 0.0, 1920.0, 1080.0),
-        ];
-        // Mac on the left of the PC: the PC's left monitor faces it.
-        assert_eq!(
-            move_on_secondary(Side::Right, &pcs, Point::new(1.0, 500.0), -10.0, 0.0),
-            Step::Stay(Point::new(-9.0, 500.0))
-        );
-        assert_eq!(
-            move_on_secondary(Side::Right, &pcs, Point::new(-1919.0, 500.0), -10.0, 0.0),
-            Step::Leave(500.0 / 1080.0)
-        );
-    }
-
-    #[test]
-    fn returns_just_inside_the_display_it_left() {
-        assert_eq!(
-            return_point(Side::Right, &AIR, 0.5),
-            Point::new(1278.0, 416.0)
-        );
-        assert_eq!(
-            return_point(Side::Top, &LG, 0.0),
-            Point::new(-320.0, -1079.0)
+            move_on_secondary(MAC, &pc, Point::new(1915.0, 500.0), 10.0, 0.0),
+            Step::Stay(Point::new(1925.0, 500.0))
         );
     }
 }

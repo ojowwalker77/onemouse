@@ -104,7 +104,6 @@ unsafe extern "C" {
     ) -> CFRunLoopSourceRef;
     pub fn CFRunLoopGetCurrent() -> CFRunLoopRef;
     pub fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
-    pub fn CFRunLoopRun();
     pub fn CFStringCreateWithCString(
         allocator: CFTypeRef,
         cstr: *const c_char,
