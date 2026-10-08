@@ -23,7 +23,8 @@ Arrange the PC from the ⇄ menu-bar item, then push the cursor where the two
 screens touch to control the PC; push it back to return.
 Ctrl+Option+Cmd+Esc always brings the cursor back to the Mac.
 
-v1 is plaintext: use it only on a trusted LAN until encryption (M2) lands.";
+The connection is encrypted. A new PC must be paired once: choose \"Pair a
+New PC…\" in the ⇄ menu and confirm that both screens show the same code.";
 
 #[derive(Debug, PartialEq)]
 enum Command {
@@ -102,11 +103,15 @@ fn main() -> ExitCode {
 mod platform {
     use std::net::{TcpListener, UdpSocket};
     use std::process::ExitCode;
+    use std::sync::Arc;
+    use std::time::Instant;
 
     use onemouse_mac::config::Config;
     use onemouse_mac::controller::Controller;
-    use onemouse_mac::server::{self, Link};
+    use onemouse_mac::pairing::Prompts;
+    use onemouse_mac::server::{self, Link, Security};
     use onemouse_mac::{log, macos};
+    use onemouse_transport::{IDENTITY_FILE, Identity, PEERS_FILE, TrustStore, discovery};
 
     use super::Command;
 
@@ -140,13 +145,37 @@ mod platform {
                 return ExitCode::FAILURE;
             }
         };
+        let security = match load_security() {
+            Ok(s) => s,
+            Err(e) => {
+                log!("can't load this Mac's key or paired PCs: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let prompts = Arc::new(Prompts::default());
+        let security = Arc::new(Security::new(security.0, security.1, {
+            let prompts = Arc::clone(&prompts);
+            Box::new(move |req| {
+                let left = req.deadline.saturating_duration_since(Instant::now());
+                prompts.ask(req, left)
+            })
+        }));
+
         let name = name.unwrap_or_else(computer_name);
         let link = Link::new();
-        server::serve(listener, link.clone(), server::Config::new(name.clone()));
+        server::serve(
+            listener,
+            link.clone(),
+            server::Config::new(name.clone(), Arc::clone(&security)),
+        );
+        let fingerprint = security.identity.fingerprint();
+        // Dropping it unregisters; it lives as long as the app.
+        let _advertisement = discovery::advertise(&name, &fingerprint, port)
+            .inspect_err(|e| log!("not advertising on the network (use --host on the PC): {e}"))
+            .ok();
 
-        log!("onemouse-mac: plaintext v1 protocol, trusted LAN only");
         log!(
-            "{name} listening on {}:{port}, PC on the {side:?} side",
+            "{name} listening on {}:{port}, key {fingerprint}",
             lan_ip().unwrap_or_else(|| "0.0.0.0".into())
         );
         log!("Ctrl+Option+Cmd+Esc brings the cursor back");
@@ -154,13 +183,32 @@ mod platform {
         let config = config_path.as_deref().map(Config::load).unwrap_or_default();
         log!("arrange the PC from the ⇄ menu-bar item");
         let controller = Controller::new(side, config.origin);
-        match macos::run(controller, link, config, config_path, scroll_speed, arrange) {
+        let app = macos::App {
+            link,
+            security,
+            prompts,
+            config,
+            config_path,
+            scroll_speed,
+            arrange_at_start: arrange,
+        };
+        match macos::run(controller, app) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 log!("{e}");
                 ExitCode::FAILURE
             }
         }
+    }
+
+    /// This Mac's key and the PCs paired with it, in
+    /// `~/Library/Application Support/onemouse`.
+    fn load_security() -> std::io::Result<(Identity, TrustStore)> {
+        let dir = onemouse_transport::config_dir()?;
+        Ok((
+            Identity::load_or_create(&dir.join(IDENTITY_FILE))?,
+            TrustStore::load(&dir.join(PEERS_FILE))?,
+        ))
     }
 
     fn computer_name() -> String {

@@ -1,21 +1,37 @@
 //! Scripted session through the real controller and listener, without the
 //! event tap: run `onemouse-win --dry-run --host 127.0.0.1` alongside and
-//! compare its log. Doesn't touch this Mac's input.
+//! compare its log. Doesn't touch this Mac's input, keys or paired PCs: it
+//! uses a throwaway key and accepts any PC (answer the pairing prompt on the
+//! dry-run side).
 
 use std::net::TcpListener;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use onemouse_mac::controller::{Controller, Input, Peer};
 use onemouse_mac::layout::{Point, Rect, Side};
-use onemouse_mac::server::{self, Link};
+use onemouse_mac::server::{self, Link, Security};
 use onemouse_protocol::key;
 use onemouse_protocol::{DEFAULT_PORT, MouseButton};
 
 fn main() {
     let listener = TcpListener::bind(("127.0.0.1", DEFAULT_PORT)).expect("port 24801 busy");
     let link = Link::new();
-    server::serve(listener, link.clone(), server::Config::new("simulated-mac"));
+    let security = Arc::new(Security::new(
+        onemouse_transport::Identity::generate().expect("random key"),
+        onemouse_transport::TrustStore::in_memory(),
+        Box::new(|req| {
+            eprintln!("pairing code {} (accepted)", req.code);
+            true
+        }),
+    ));
+    security.open_pairing(Duration::from_secs(3600));
+    server::serve(
+        listener,
+        link.clone(),
+        server::Config::new("simulated-mac", security),
+    );
     eprintln!("waiting for onemouse-win…");
     while !link.with_peer(|p| p.is_some()) {
         thread::sleep(Duration::from_millis(100));

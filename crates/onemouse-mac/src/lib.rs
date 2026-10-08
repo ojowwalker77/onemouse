@@ -10,6 +10,7 @@ pub mod config;
 pub mod controller;
 pub mod keymap;
 pub mod layout;
+pub mod pairing;
 pub mod server;
 
 #[cfg(target_os = "macos")]
