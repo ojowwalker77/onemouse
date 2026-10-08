@@ -482,12 +482,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "onemouse-core"
+version = "0.1.0"
+dependencies = [
+ "onemouse-protocol",
+]
+
+[[package]]
 name = "onemouse-mac"
 version = "0.1.0"
 dependencies = [
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
+ "onemouse-core",
  "onemouse-protocol",
  "onemouse-transport",
 ]

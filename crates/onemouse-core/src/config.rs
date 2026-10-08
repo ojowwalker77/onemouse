@@ -8,7 +8,7 @@
 
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use onemouse_protocol::Display;
 
@@ -21,12 +21,6 @@ pub struct Config {
 }
 
 impl Config {
-    /// `~/Library/Application Support/onemouse/arrangement`.
-    pub fn default_path() -> Option<PathBuf> {
-        let home = std::env::var_os("HOME")?;
-        Some(Path::new(&home).join("Library/Application Support/onemouse/arrangement"))
-    }
-
     /// A missing or unreadable file is an empty config; bad lines are skipped.
     pub fn load(path: &Path) -> Self {
         fs::read_to_string(path)

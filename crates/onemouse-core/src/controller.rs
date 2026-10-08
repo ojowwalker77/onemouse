@@ -7,8 +7,8 @@ use std::collections::BTreeSet;
 use onemouse_protocol::key::{self, KeyCode};
 use onemouse_protocol::{Display, Message, MouseButton};
 
-use crate::keymap;
 use crate::layout::{self, Placed, Point, Rect, Side, Step};
+use crate::translate;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Input {
@@ -207,7 +207,7 @@ impl Controller {
                 .iter()
                 .filter(|code| code.is_modifier())
                 .map(|&code| Message::Key {
-                    code: keymap::to_secondary(code),
+                    code: translate::to_secondary(code),
                     pressed: true,
                 }),
         );
@@ -267,7 +267,7 @@ impl Controller {
                     return self.go_local(None, true);
                 }
                 send.push(Message::Key {
-                    code: keymap::to_secondary(code),
+                    code: translate::to_secondary(code),
                     pressed,
                 });
             }
