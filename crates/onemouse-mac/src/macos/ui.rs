@@ -287,8 +287,12 @@ impl Target {
             request.code,
             short(&request.peer_fingerprint)
         )));
-        alert.addButtonWithTitle(&NSString::from_str("Pair"));
-        alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+        let pair = alert.addButtonWithTitle(&NSString::from_str("Pair"));
+        let cancel = alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+        // Return must not mean "Pair": the dialog can pop up mid-typing, and
+        // pairing only protects anything if someone compared the codes.
+        pair.setKeyEquivalent(&NSString::from_str(""));
+        cancel.setKeyEquivalent(&NSString::from_str("\r"));
         // Closes itself when the handshake stops waiting for an answer.
         let left = request.deadline.saturating_duration_since(Instant::now());
         // SAFETY: `self` implements `abortPairingDialog:`; the timer is
