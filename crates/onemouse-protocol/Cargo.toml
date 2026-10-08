@@ -1,0 +1,11 @@
+[package]
+name = "onemouse-protocol"
+description = "Wire protocol shared by the onemouse primary (macOS) and secondary (Windows)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
+serde = { version = "1.0.229", features = ["derive"] }
