@@ -21,7 +21,7 @@ cargo test
 On the Mac (grant your terminal **Accessibility** and **Input Monitoring** when asked):
 
 ```sh
-cargo run --release -p onemouse-mac -- --side right   # where the PC sits: left/right/top/bottom
+cargo run --release -p onemouse-mac -- --arrange   # then drag the PC to where it sits
 ```
 
 On the PC:
@@ -30,6 +30,6 @@ On the PC:
 cargo run --release -p onemouse-win -- --host <mac-ip>
 ```
 
-Push the cursor past that edge of the Mac to control the PC, and push it back to return. **Ctrl+Option+Cmd+Esc** always brings it home.
+The ⇄ menu-bar item opens **Arrange Displays**: drag the PC next to your Mac screens, the way System Settings arranges monitors. Push the cursor where they touch to control the PC, and push it back to return. **Ctrl+Option+Cmd+Esc** always brings it home.
 
 To test without a PC, run `cargo run -p onemouse-win -- --dry-run --host 127.0.0.1`, or run `cargo run -p onemouse-mac --example simulate` for a scripted session that doesn't touch your input.
