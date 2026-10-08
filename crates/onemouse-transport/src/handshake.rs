@@ -160,11 +160,11 @@ fn establish(
 ) -> Result<(SecureStream, Peer), Error> {
     let previous_timeout = stream.read_timeout()?;
     stream.set_read_timeout(Some(opts.handshake_timeout))?;
-    let result = establish_inner(stream.try_clone()?, opts, initiator);
+    let (secure, peer) = establish_inner(stream, opts, initiator)?;
     // Best effort: macOS returns EINVAL for setsockopt once the peer has
     // closed, and the handshake's own result matters more.
-    let _ = stream.set_read_timeout(previous_timeout);
-    result
+    let _ = secure.set_read_timeout(previous_timeout);
+    Ok((secure, peer))
 }
 
 fn establish_inner(
@@ -200,10 +200,13 @@ fn establish_inner(
         .ok_or_else(|| Error::Protocol("no remote static key".into()))?;
     let code = pairing_code(hs.get_handshake_hash());
     let state = hs.into_stateless_transport_mode()?;
-    let (reader, writer) = halves(state, stream.try_clone()?, stream.try_clone()?);
+    // The reader keeps the original handle: on Windows, socket options such
+    // as the read timeout aren't shared with `try_clone`d handles.
+    let writer = stream.try_clone()?;
+    let (reader, writer) = halves(state, stream, writer);
     let mut secure = SecureStream { reader, writer };
 
-    let newly_paired = exchange_trust(&mut secure, &stream, opts, &peer_name, &key, code)?;
+    let newly_paired = exchange_trust(&mut secure, opts, &peer_name, &key, code)?;
     Ok((
         secure,
         Peer {
@@ -227,7 +230,6 @@ const TRUST_KEY_CHANGED: u8 = 2;
 /// needs our own user's confirmation.
 fn exchange_trust(
     secure: &mut SecureStream,
-    tcp: &TcpStream,
     opts: &Options,
     peer_name: &str,
     key: &PublicKey,
@@ -299,7 +301,7 @@ fn exchange_trust(
         .max(Duration::from_millis(1));
     // Best effort (see `establish`): if the peer already closed, the read
     // below reports it, e.g. after its `[0]`.
-    let _ = tcp.set_read_timeout(Some(remaining));
+    let _ = secure.set_read_timeout(Some(remaining));
     let answer = match read_record(secure) {
         Ok(answer) => answer,
         Err(Error::Io(e))

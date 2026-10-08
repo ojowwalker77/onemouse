@@ -5,6 +5,7 @@
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::Arc;
+use std::time::Duration;
 
 use snow::StatelessTransportState;
 
@@ -61,6 +62,13 @@ pub(crate) fn halves<R, W>(
 
 fn bad_data(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what.to_owned())
+}
+
+impl SecureReader<TcpStream> {
+    /// See [`SecureStream::set_read_timeout`].
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.inner.set_read_timeout(timeout)
+    }
 }
 
 impl<S: Read> SecureReader<S> {
@@ -167,9 +175,16 @@ impl SecureStream {
         (self.reader, self.writer)
     }
 
-    /// The underlying socket, e.g. for timeouts or `peer_addr`.
+    /// The socket the reader half reads from (e.g. for `peer_addr` or
+    /// `shutdown`).
     pub fn tcp(&self) -> &TcpStream {
         self.reader.get_ref()
+    }
+
+    /// Read timeout for the reader half. Set it here, not on another clone of
+    /// the socket: on Windows, cloned handles don't share socket options.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.tcp().set_read_timeout(timeout)
     }
 
     pub fn shutdown(&self) -> io::Result<()> {
