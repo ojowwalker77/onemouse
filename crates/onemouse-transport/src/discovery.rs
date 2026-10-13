@@ -1,7 +1,12 @@
 //! mDNS: the primary advertises [`SERVICE_TYPE`] with its name and key
 //! fingerprint, the secondary browses for it.
 
+mod legacy;
+
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
@@ -52,9 +57,16 @@ pub fn advertise(name: &str, fingerprint: &str, port: u16) -> Result<Advertiseme
 
 /// How long [`browse`] keeps listening after `want` turned up.
 const MATCH_GRACE: Duration = Duration::from_millis(500);
+/// How long one wait on the mDNS daemon lasts before checking the
+/// legacy-unicast answers.
+const POLL: Duration = Duration::from_millis(50);
 
 /// Browses for primaries for up to `timeout`, or until shortly after one
 /// matching `want` (a fingerprint, speaking our protocol version) shows up.
+///
+/// Two queriers run side by side: the `mdns-sd` daemon (port 5353), and
+/// one-shot legacy-unicast queries ([`legacy`]), whose unicast answers get
+/// through where multicast ones don't (Windows on a Public network, #12).
 ///
 /// Returns **every** distinct answer, including several claiming the same
 /// fingerprint (anyone can advertise a public fingerprint): callers should
@@ -63,12 +75,34 @@ const MATCH_GRACE: Duration = Duration::from_millis(500);
 pub fn browse(timeout: Duration, want: Option<&str>) -> Result<Vec<Found>, Error> {
     let daemon = ServiceDaemon::new()?;
     let events = daemon.browse(SERVICE_TYPE)?;
-    let deadline = Instant::now() + timeout;
-    let mut deadline = deadline;
+    let mut deadline = Instant::now() + timeout;
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, legacy_found) = mpsc::channel();
+    let legacy = {
+        let stop = Arc::clone(&stop);
+        let end = deadline;
+        thread::spawn(move || legacy::browse(SERVICE_TYPE, end, &stop, &tx))
+    };
     let mut found: Vec<Found> = Vec::new();
+    let mut add = |entry: Found, deadline: &mut Instant| {
+        let matched =
+            want == Some(entry.fingerprint.as_str()) && entry.version == Some(PROTOCOL_VERSION);
+        // Every distinct answer is kept: a spoofer advertising the same
+        // name or fingerprint must not hide the real one.
+        if !found.contains(&entry) {
+            found.push(entry);
+        }
+        if matched {
+            // Keep listening briefly for competing answers.
+            *deadline = (*deadline).min(Instant::now() + MATCH_GRACE);
+        }
+    };
     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-        let Ok(event) = events.recv_timeout(left) else {
-            break;
+        while let Ok(entry) = legacy_found.try_recv() {
+            add(entry, &mut deadline);
+        }
+        let Ok(event) = events.recv_timeout(left.min(POLL)) else {
+            continue;
         };
         if let ServiceEvent::ServiceResolved(service) = event {
             let Some(fp) = service.get_property_val_str("fp") else {
@@ -92,18 +126,11 @@ pub fn browse(timeout: Duration, want: Option<&str>) -> Result<Vec<Found>, Error
                 },
                 port: service.port,
             };
-            let matched = want == Some(fp) && entry.version == Some(PROTOCOL_VERSION);
-            // Every distinct answer is kept: a spoofer advertising the same
-            // name or fingerprint must not hide the real one.
-            if !found.contains(&entry) {
-                found.push(entry);
-            }
-            if matched {
-                // Keep listening briefly for competing answers.
-                deadline = deadline.min(Instant::now() + MATCH_GRACE);
-            }
+            add(entry, &mut deadline);
         }
     }
+    stop.store(true, Ordering::Relaxed);
+    let _ = legacy.join();
     let _ = daemon.stop_browse(SERVICE_TYPE);
     let _ = daemon.shutdown();
     found.sort_by(|a, b| a.name.cmp(&b.name));
