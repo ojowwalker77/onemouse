@@ -645,6 +645,9 @@ fn read_loop<H: Host, B: Backend>(
             | Message::Key { .. }) => {
                 if role.get() == Main::Client {
                     log!("ignoring {input:?}: this PC is main");
+                    // Main since the user's tray click: whatever the Mac
+                    // held here goes up now (its Leave is ignored too).
+                    session.release(&mut lock(injector));
                 } else {
                     session.handle(input, &mut lock(injector))?;
                 }
@@ -661,6 +664,10 @@ fn read_loop<H: Host, B: Backend>(
                 log!("main is now {main:?}");
                 // Adopted and persisted, never echoed.
                 role.adopt(main);
+                if main == Main::Client {
+                    // The Mac's input stops here: release what it held.
+                    session.release(&mut lock(injector));
+                }
             }
             Message::Reject { reason } => return Err(ClientError::Rejected(reason)),
             Message::Hello(_) | Message::Welcome { .. } => {
@@ -729,6 +736,13 @@ pub struct Session {
 }
 
 impl Session {
+    /// Lets go of everything still held, as on `Leave`, if entered.
+    pub fn release<B: Backend>(&mut self, inj: &mut Injector<B>) {
+        if std::mem::take(&mut self.entered) {
+            inj.release_all();
+        }
+    }
+
     /// Injection failures (e.g. UIPI blocking input to an elevated window)
     /// are logged, not fatal.
     pub fn handle<B: Backend>(
@@ -1224,6 +1238,36 @@ mod tests {
         );
         assert_eq!(read_message(&mut primary).unwrap(), Message::Pong(5));
         assert!(h.events().is_empty());
+        drop(primary);
+        client.join().unwrap().unwrap_err();
+    }
+
+    #[test]
+    fn becoming_main_releases_what_the_mac_held() {
+        let h = Harness::new();
+        let (mut primary, client) = h.start();
+        welcome(&mut primary);
+        send(
+            &mut primary,
+            &[
+                Message::Enter { x: 0, y: 0 },
+                Message::Key {
+                    code: key::LEFT_ALT,
+                    pressed: true,
+                },
+                Message::SetMain { main: Main::Client },
+                Message::Ping(3),
+            ],
+        );
+        assert_eq!(read_message(&mut primary).unwrap(), Message::Pong(3));
+        assert_eq!(
+            h.events(),
+            [
+                Recorded::Move(0, 0),
+                Recorded::Key(k(key::LEFT_ALT), true),
+                Recorded::Key(k(key::LEFT_ALT), false),
+            ]
+        );
         drop(primary);
         client.join().unwrap().unwrap_err();
     }

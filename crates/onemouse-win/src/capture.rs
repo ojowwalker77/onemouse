@@ -59,6 +59,13 @@ pub trait Cursor: Send {
     fn went_local(&mut self, at: Option<(i32, i32)>);
 }
 
+/// `Arrangement` is the PC's origin in Mac points; the controller wants the
+/// remote (the Mac) in local units. The PC's visual units are the same size
+/// as the Mac's layout points, so it's the same offset, reversed.
+fn mac_origin(server: &ServerInfo) -> Option<Point> {
+    server.arrangement.map(|o| Point::new(-o.x, -o.y))
+}
+
 fn scale_of(d: &Display) -> f64 {
     let scale = f64::from(d.scale);
     if scale > 0.0 { scale } else { 1.0 }
@@ -181,7 +188,7 @@ impl<C: Cursor> MainSide<C> {
                 Os::Windows,
                 server.os,
                 Side::Left,
-                server.arrangement,
+                mac_origin(server),
             ),
             local: LocalSpace::new(local),
             server: server.displays.clone(),
@@ -196,7 +203,7 @@ impl<C: Cursor> MainSide<C> {
     /// New displays/arrangement (or a new connection `peer`): no input lost.
     pub fn update(&mut self, local: &[Display], server: &ServerInfo, peer: Option<u64>) {
         self.local = LocalSpace::new(local);
-        self.controller.set_arrangement(server.arrangement);
+        self.controller.set_arrangement(mac_origin(server));
         self.server = server.displays.clone();
         if let Some(peer) = peer {
             self.peer = peer;
@@ -833,6 +840,36 @@ mod tests {
         // Deeper into the Mac: 1 visual unit = 1 point.
         assert!(side.mouse_at(-6, 502)); // visual (-4.8, 401.6)
         assert_eq!(recv_all(&rx), [Message::MouseMove { x: 1459, y: 448 }]);
+    }
+
+    #[test]
+    fn arrangement_from_the_mac_places_the_mac_on_the_other_side() {
+        // The Mac's Arrange put the PC on its right: the PC's (0, 0) sits
+        // at Mac point (1470, 0), so the Mac is on the PC's left.
+        let right = ServerInfo {
+            arrangement: Some(Point::new(1470.0, 0.0)),
+            ..server()
+        };
+        let (tx, rx) = mpsc::channel();
+        let mut side = MainSide::new(tx, RecordingCursor::default(), &pc(), &right, 1);
+        assert!(!side.mouse_at(10, 500));
+        assert!(side.mouse_at(2, 500));
+        // Entry at visual (-4.8, 400) = Mac points (1465.2, 400): the Mac's
+        // right edge, same height (the tops line up).
+        assert_eq!(recv_all(&rx), [Message::Enter { x: 1465, y: 400 }]);
+
+        // Rearranged with the PC on the Mac's left: crossing the PC's right
+        // edge enters the Mac's left edge.
+        let left = ServerInfo {
+            arrangement: Some(Point::new(-1536.0, 0.0)),
+            ..server()
+        };
+        let (tx, rx) = mpsc::channel();
+        let mut side = MainSide::new(tx, RecordingCursor::default(), &pc(), &left, 1);
+        assert!(!side.mouse_at(1910, 500));
+        assert!(side.mouse_at(1919, 500));
+        // Visual 1535.2 plus the 7.2 overshoot, minus the Mac's -1536 origin.
+        assert_eq!(recv_all(&rx), [Message::Enter { x: 6, y: 400 }]);
     }
 
     #[test]
