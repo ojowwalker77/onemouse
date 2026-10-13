@@ -5,6 +5,7 @@
 //! keymap and networking here are portable too. The event tap, cursor
 //! control and menu-bar UI are behind `cfg(macos)`.
 
+pub mod inject;
 pub mod install;
 pub mod keymap;
 pub mod pairing;

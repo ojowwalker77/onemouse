@@ -526,6 +526,7 @@ dependencies = [
 name = "onemouse-win"
 version = "0.1.0"
 dependencies = [
+ "onemouse-core",
  "onemouse-protocol",
  "onemouse-transport",
  "tempfile",

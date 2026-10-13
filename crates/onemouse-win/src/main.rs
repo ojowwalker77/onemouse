@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use onemouse_protocol::Display;
 use onemouse_transport::{IDENTITY_FILE, Identity, PEERS_FILE, PairingRequest, TrustStore};
-use onemouse_win::client::{self, Config, Security, StaticHost};
+use onemouse_win::client::{self, Config, Role, Security, StaticHost};
 use onemouse_win::inject::{Injector, LogBackend};
 use onemouse_win::log;
 
@@ -301,10 +301,15 @@ fn start(run: Run, security: Arc<Security>, dir: &Path) -> io::Result<()> {
         Some(displays) => {
             let name = run.name.unwrap_or_else(|| "onemouse-dry-run".into());
             log!("dry run as {name}: logging input instead of injecting it");
+            let host = Arc::new(StaticHost { name, displays });
+            // No hooks off Windows (and never in a dry run): the role
+            // transitions still work, the PC just never goes remote.
+            let role = Arc::new(Role::new(&host, false));
             client::run(
                 &config,
-                Arc::new(StaticHost { name, displays }),
+                host,
                 Arc::new(Mutex::new(Injector::new(LogBackend))),
+                &role,
             )
         }
         None => platform::run(&config, run.name, &dir.join(LOG_FILE)),
@@ -323,7 +328,7 @@ mod platform {
 
     use onemouse_transport::PairingRequest;
     use onemouse_win::autostart::{self, SingleInstance};
-    use onemouse_win::client::{self, Config, SharedInjector};
+    use onemouse_win::client::{self, Config, Host, SharedInjector};
     use onemouse_win::inject::Injector;
     use onemouse_win::sendinput::SendInputBackend;
     use onemouse_win::{WindowsHost, display, log, tray};
@@ -481,8 +486,14 @@ mod platform {
         let name = name
             .or_else(|| std::env::var("COMPUTERNAME").ok())
             .unwrap_or_else(|| "windows".into());
-        log!("injecting input as {name}");
-        client::run(config, Arc::new(WindowsHost { name }), injector)
+        let host = Arc::new(WindowsHost {
+            name,
+            config_path: log_path.parent().map(|dir| dir.join("arrangement")),
+        });
+        let role = Arc::new(client::Role::new(&host, true));
+        tray::set_role(Arc::clone(&role));
+        log!("injecting input as {}", host.name());
+        client::run(config, host, injector, &role)
     }
 }
 

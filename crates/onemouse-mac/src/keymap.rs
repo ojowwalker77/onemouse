@@ -1,4 +1,4 @@
-//! macOS virtual keycodes (`kVK_*`, Carbon `Events.h`) → USB HID usages.
+//! macOS virtual keycodes (`kVK_*`, Carbon `Events.h`) ↔ USB HID usages.
 //!
 //! Portable on purpose so the table is tested on every CI runner.
 
@@ -135,6 +135,11 @@ pub fn from_mac(vk: u16, iso: bool) -> Option<KeyCode> {
     })
 }
 
+/// The reverse of [`from_mac`]: the virtual keycode to post for a key.
+pub fn to_mac(code: KeyCode, iso: bool) -> Option<u16> {
+    (0..=0x7F).find(|&vk| from_mac(vk, iso) == Some(code))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +168,18 @@ mod tests {
             ["PRINT_SCREEN", "SCROLL_LOCK", "PAUSE"],
             "unmapped keys"
         );
+    }
+
+    #[test]
+    fn to_mac_inverts_from_mac() {
+        for iso in [false, true] {
+            for vk in 0..=0x7F {
+                if let Some(code) = from_mac(vk, iso) {
+                    assert_eq!(to_mac(code, iso), Some(vk), "vk={vk:#x} iso={iso}");
+                }
+            }
+        }
+        assert_eq!(to_mac(PRINT_SCREEN, false), None);
     }
 
     #[test]

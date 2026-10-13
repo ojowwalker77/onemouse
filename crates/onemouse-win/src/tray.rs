@@ -7,7 +7,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -17,22 +17,29 @@ use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
-    GetCursorPos, GetMessageW, IDI_APPLICATION, LoadIconW, MF_SEPARATOR, MF_STRING, MSG,
-    PostMessageW, RegisterClassW, RegisterWindowMessageW, SW_SHOWNORMAL, SetForegroundWindow,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CONTEXTMENU,
-    WM_ENDSESSION, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+    AppendMenuW, CheckMenuItem, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
+    DispatchMessageW, GetCursorPos, GetMessageW, IDI_APPLICATION, LoadIconW, MF_BYCOMMAND,
+    MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, PostMessageW, RegisterClassW,
+    RegisterWindowMessageW, SW_SHOWNORMAL, SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenu, TranslateMessage, WM_APP, WM_CONTEXTMENU, WM_ENDSESSION, WM_LBUTTONUP, WM_NULL,
+    WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
 };
 
-use crate::log;
+use crate::client::Role;
+use crate::{WindowsHost, log};
+
+use onemouse_protocol::Main;
 
 const CALLBACK: u32 = WM_APP + 1;
 const CMD_OPEN_LOG: usize = 1;
 const CMD_QUIT: usize = 2;
+const CMD_MAIN_PC: usize = 3;
+const CMD_MAIN_MAC: usize = 4;
 
 static HWND_TRAY: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(ptr::null_mut());
 static STATUS: Mutex<String> = Mutex::new(String::new());
 static HOOKS: OnceLock<Hooks> = OnceLock::new();
+static ROLE: Mutex<Option<Arc<Role<WindowsHost>>>> = Mutex::new(None);
 
 struct Hooks {
     log_path: PathBuf,
@@ -60,6 +67,12 @@ pub fn start(log_path: PathBuf, on_quit: impl Fn() + Send + Sync + 'static) {
     if let Err(e) = spawned {
         log!("can't start the tray icon: {e}");
     }
+}
+
+/// The role switch ("keyboard & mouse are on") acts on this; set once at
+/// startup so the menu can offer it.
+pub fn set_role(role: Arc<Role<WindowsHost>>) {
+    *ROLE.lock().unwrap_or_else(|e| e.into_inner()) = Some(role);
 }
 
 /// Updates the tooltip (at most 127 characters are shown).
@@ -118,6 +131,31 @@ fn show_menu(hwnd: HWND) {
             status.as_ptr(),
         );
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+        AppendMenuW(
+            menu,
+            MF_STRING | 0x2, /* MF_DISABLED */
+            0,
+            wide("Keyboard and mouse are on:").as_ptr(),
+        );
+        let main = ROLE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|role| role.get());
+        AppendMenuW(menu, MF_STRING, CMD_MAIN_PC, wide("This PC").as_ptr());
+        AppendMenuW(menu, MF_STRING, CMD_MAIN_MAC, wide("This Mac").as_ptr());
+        if main.is_some() {
+            let check = |id: usize, on: bool| {
+                CheckMenuItem(
+                    menu,
+                    id as u32,
+                    MF_BYCOMMAND | if on { MF_CHECKED } else { MF_UNCHECKED },
+                );
+            };
+            check(CMD_MAIN_PC, main == Some(Main::Client));
+            check(CMD_MAIN_MAC, main == Some(Main::Server));
+        }
+        AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
         AppendMenuW(menu, MF_STRING, CMD_OPEN_LOG, wide("Open log").as_ptr());
         AppendMenuW(menu, MF_STRING, CMD_QUIT, wide("Quit onemouse").as_ptr());
         let mut pos = POINT { x: 0, y: 0 };
@@ -149,6 +187,17 @@ fn show_menu(hwnd: HWND) {
                 }
             }
             CMD_QUIT => quit(hwnd),
+            CMD_MAIN_PC | CMD_MAIN_MAC => {
+                let main = if cmd == CMD_MAIN_PC {
+                    Main::Client
+                } else {
+                    Main::Server
+                };
+                if let Some(role) = ROLE.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+                    role.request(main);
+                    log!("keyboard and mouse are on {main:?}");
+                }
+            }
             _ => {}
         }
     }
