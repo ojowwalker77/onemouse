@@ -18,7 +18,7 @@ The TCP connection is encrypted and mutually authenticated by [`crates/onemouse-
 3. Pairing: both screens show a 6-digit code derived from the handshake hash **and two random nonces exchanged commit-then-reveal** (the initiator commits to its nonce before seeing the responder's, so nobody, not even a man in the middle running two handshakes, can steer the code). Both users confirm it matches, then each side pins the other's key. The server only pairs while its user has pairing mode open, one pairing at a time. 60 s limit.
 4. Everything below (framing, messages) runs unchanged inside encrypted records.
 
-Discovery: the server advertises `_onemouse._tcp` over mDNS with TXT `fp=<key fingerprint>`, `name=`, `v=<PROTOCOL_VERSION>`.
+Discovery: the server advertises `_onemouse._tcp` over mDNS with TXT `fp=<key fingerprint>`, `name=`, `v=<PROTOCOL_VERSION>`. The client browses with both a regular mDNS querier and one-shot legacy-unicast queries (RFC 6762 §6.7: ephemeral source port, answered by unicast), because some host firewalls drop the multicast answers (Windows on a Public network).
 
 ## Framing
 
